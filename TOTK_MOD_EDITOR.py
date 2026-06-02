@@ -2,15 +2,14 @@
 # -*- coding: utf-8 -*-
 """
 TOTK MOD EDITOR – Outil de modding tout-en-un pour Nintendo Switch
-Version 4.0 – Arborescence, prévisualisation, comparaison, sauvegarde sécurisée
+Version 4.1 – Code complet corrigé
 """
 
-import sys, os, io, struct, fnmatch, tempfile, shutil, zipfile, tarfile, difflib
+import sys, os, io, struct, re, fnmatch, tempfile, shutil, zipfile, tarfile, difflib
 from pathlib import Path
 from io import BytesIO
-from typing import Dict, List, Optional, Tuple
 
-# ─── Dépendances externes ─────────────────────────────────
+# Dépendances externes
 try:
     import yaml
     HAS_YAML = True
@@ -36,8 +35,7 @@ import zstandard as zstd
 
 # ─── Configuration des jeux ──────────────────────────────────
 class GameConfig:
-    def __init__(self, name: str, lbl1_slots: int = 101, hash_mult: int = 0x492,
-                 align: int = 16, langs: List[str] = None):
+    def __init__(self, name, lbl1_slots=101, hash_mult=0x492, align=16, langs=None):
         self.name = name
         self.lbl1_slots = lbl1_slots
         self.hash_mult = hash_mult
@@ -57,27 +55,29 @@ current_game = GAMES["TotK"]
 # ─── Dictionnaire Zstd ──────────────────────────────────────
 _zstd_dict = None
 
-def set_zstd_dict(path: str):
+def set_zstd_dict(path):
     global _zstd_dict
     with open(path, 'rb') as f:
         _zstd_dict = zstd.ZstdCompressionDict(f.read())
 
-def decompress_zs(data: bytes) -> bytes:
+def decompress_zs(data):
     dctx = zstd.ZstdDecompressor(dict_data=_zstd_dict) if _zstd_dict else zstd.ZstdDecompressor()
     for method in [dctx.decompress,
                    lambda d: dctx.decompress(d, max_output_size=200_000_000),
                    lambda d: dctx.stream_reader(BytesIO(d)).read()]:
-        try: return method(data)
-        except: pass
+        try:
+            return method(data)
+        except:
+            pass
     return data
 
-def compress_zs(data: bytes) -> bytes:
+def compress_zs(data):
     cctx = zstd.ZstdCompressor(dict_data=_zstd_dict) if _zstd_dict else zstd.ZstdCompressor()
     return cctx.compress(data)
 
 # ─── Module SARC ────────────────────────────────────────────
 class SarcReader:
-    def __init__(self, data: bytes):
+    def __init__(self, data):
         self.data = data
         self.stream = BytesIO(data)
         self.files = {}
@@ -132,10 +132,10 @@ class SarcReader:
             if start <= end <= len(self.data):
                 self.files[name] = self.data[start:end]
 
-    def list_files(self) -> List[str]:
+    def list_files(self):
         return list(self.files.keys())
 
-    def get_file(self, name: str) -> bytes:
+    def get_file(self, name):
         return self.files.get(name, b'')
 
 
@@ -143,17 +143,17 @@ class SarcWriter:
     def __init__(self):
         self.entries = []  # list of (name, data)
 
-    def add_file(self, name: str, data: bytes):
+    def add_file(self, name, data):
         self.entries.append((name, data))
 
     @staticmethod
-    def _hash(name: str, mult: int = 0x65) -> int:
+    def _hash(name, mult=0x65):
         h = 0
         for c in name.encode('utf-8'):
             h = (h * mult + c) & 0xFFFFFFFF
         return h
 
-    def save(self) -> bytes:
+    def save(self):
         self.entries.sort(key=lambda x: self._hash(x[0]))
         fc = len(self.entries)
 
@@ -218,11 +218,12 @@ class SarcWriter:
         out.write(data_data)
         return out.getvalue()
 
+
 # ─── Module MSBT ────────────────────────────────────────────
 class MsbtParser:
     MAGIC = b'MsgStdBn'
 
-    def __init__(self, data: bytes, game_cfg: GameConfig = None):
+    def __init__(self, data, game_cfg=None):
         self.raw = data
         self.game = game_cfg or current_game
         self.labels = []
@@ -303,13 +304,13 @@ class MsbtParser:
                 cp = struct.unpack('<H', raw2)[0]
                 if cp == 0:
                     break
-                if cp == 0x000E:  # tag début
+                if cp == 0x000E:
                     grp = struct.unpack('<H', s.read(2))[0]
                     typ = struct.unpack('<H', s.read(2))[0]
                     dsz = struct.unpack('<H', s.read(2))[0]
                     dat = s.read(dsz)
                     chars.append(f'<tag grp={grp} typ={typ} data={dat.hex()}>')
-                elif cp == 0x000F:  # tag fin
+                elif cp == 0x000F:
                     chars.append('</tag>')
                 else:
                     try:
@@ -319,7 +320,7 @@ class MsbtParser:
             texts.append(''.join(chars))
         return texts
 
-    def to_txt(self) -> str:
+    def to_txt(self):
         lines = []
         for label in self.labels:
             lines.append(f'[{label}]')
@@ -327,7 +328,7 @@ class MsbtParser:
             lines.append('---')
         return '\n'.join(lines)
 
-    def from_txt(self, txt: str):
+    def from_txt(self, txt):
         current = None
         buf = []
         for line in txt.splitlines():
@@ -347,7 +348,7 @@ class MsbtParser:
         if current is not None and current in self.texts:
             self.texts[current] = '\n'.join(buf)
 
-    def save(self) -> bytes:
+    def save(self):
         cfg = self.game
         out = BytesIO()
         out.write(self.MAGIC)
@@ -415,7 +416,7 @@ class MsbtParser:
         out.write(struct.pack('<I', total))
         return out.getvalue()
 
-    def _encode_text(self, text: str) -> bytes:
+    def _encode_text(self, text):
         out = BytesIO()
         i = 0
         while i < len(text):
@@ -449,11 +450,11 @@ class MsbtParser:
         return out.getvalue()
 
 # ─── Utilitaires fichiers/archives ──────────────────────────
-def read_file(path: str) -> bytes:
+def read_file(path):
     with open(path, 'rb') as f:
         return f.read()
 
-def archive_list(path: str) -> List[str]:
+def archive_list(path):
     ext = Path(path).suffix.lower()
     try:
         if ext == '.zip':
@@ -475,7 +476,7 @@ def archive_list(path: str) -> List[str]:
     except:
         return []
 
-def archive_extract(arc_path: str, internal: str) -> bytes:
+def archive_extract(arc_path, internal):
     ext = Path(arc_path).suffix.lower()
     if ext == '.zip':
         with zipfile.ZipFile(arc_path) as z:
@@ -495,7 +496,7 @@ def archive_extract(arc_path: str, internal: str) -> bytes:
         return dec
     return b''
 
-def archive_update(arc_path: str, internal: str, new_data: bytes):
+def archive_update(arc_path, internal, new_data):
     ext = Path(arc_path).suffix.lower()
     if ext == '.zip':
         tmp = tempfile.mkdtemp()
@@ -533,7 +534,7 @@ def archive_update(arc_path: str, internal: str, new_data: bytes):
                 f.write(compress_zs(new_data))
 
 # ─── Détection de type et vue hex ──────────────────────────
-def is_text(data: bytes) -> bool:
+def is_text(data):
     if not data:
         return False
     sample = data[:4096]
@@ -542,7 +543,7 @@ def is_text(data: bytes) -> bool:
     ctrl = sum(1 for b in sample if b < 0x20 and b not in (9, 10, 13))
     return (ctrl / len(sample)) <= 0.05
 
-def build_hex_view(data: bytes, max_bytes=65536) -> str:
+def build_hex_view(data, max_bytes=65536):
     lines = []
     hdr = f"{'OFFSET':>10}  {'00 01 02 03 04 05 06 07  08 09 0A 0B 0C 0D 0E 0F':49}  ASCII"
     lines.append(hdr)
@@ -558,7 +559,7 @@ def build_hex_view(data: bytes, max_bytes=65536) -> str:
         lines.append(f'... ({len(data):,} octets total)')
     return '\n'.join(lines)
 
-def decode_file(raw: bytes, hint_ext: str = '') -> Tuple[str, str, bytes, bool, Optional[MsbtParser]]:
+def decode_file(raw, hint_ext=''):
     is_z = False
     if raw[:4] == b'\x28\xB5\x2F\xFD':
         try:
@@ -566,18 +567,13 @@ def decode_file(raw: bytes, hint_ext: str = '') -> Tuple[str, str, bytes, bool, 
             is_z = True
         except:
             pass
-
     ext = hint_ext.lower()
-
-    # MSBT
     if ext == '.msbt' or raw[:8] == b'MsgStdBn':
         try:
             msbt = MsbtParser(raw)
             return 'msbt', msbt.to_txt(), raw, is_z, msbt
         except:
             pass
-
-    # Texte
     if is_text(raw):
         try:
             return 'text', raw.decode('utf-8'), raw, is_z, None
@@ -587,8 +583,6 @@ def decode_file(raw: bytes, hint_ext: str = '') -> Tuple[str, str, bytes, bool, 
             return 'text', raw.decode('utf-16'), raw, is_z, None
         except:
             pass
-
-    # Hex
     return 'hex', build_hex_view(raw), raw, is_z, None
 
 # ─── Coloration syntaxique ─────────────────────────────────
@@ -600,7 +594,6 @@ class HexHighlighter(QSyntaxHighlighter):
         fmt_hex.setForeground(QColor('#CE9178'))
         fmt_asc = QTextCharFormat()
         fmt_asc.setForeground(QColor('#4EC9B0'))
-
         if text.startswith('0x'):
             self.setFormat(0, 10, fmt_off)
             self.setFormat(12, 49, fmt_hex)
@@ -616,7 +609,6 @@ class MsbtHighlighter(QSyntaxHighlighter):
         fmt_sep.setForeground(QColor('#555555'))
         fmt_tag = QTextCharFormat()
         fmt_tag.setForeground(QColor('#C586C0'))
-
         if text.startswith('[') and text.endswith(']'):
             self.setFormat(0, len(text), fmt_lbl)
         elif text == '---':
@@ -625,7 +617,7 @@ class MsbtHighlighter(QSyntaxHighlighter):
             for m in re.finditer(r'</?tag[^>]*>', text):
                 self.setFormat(m.start(), m.end() - m.start(), fmt_tag)
 
-# ─── Dialogue recherche/remplacement ───────────────────────
+# ─── Dialogue recherche/remplacement (corrigé) ─────────────
 class FindReplaceDialog(QDialog):
     def __init__(self, editor, parent=None):
         super().__init__(parent)
@@ -687,8 +679,10 @@ class FindReplaceDialog(QDialog):
             return None
 
     def _refresh(self):
+        # Effacer l'ancienne surbrillance
         cur = self.editor.textCursor()
-        cur.select(QTextCursor.Document)
+        cur.movePosition(QTextCursor.Start)
+        cur.movePosition(QTextCursor.End, QTextCursor.KeepAnchor)
         cur.setCharFormat(QTextCharFormat())
         self.editor.setTextCursor(cur)
 
@@ -749,7 +743,7 @@ class FindReplaceDialog(QDialog):
 
 # ─── Dialogue de comparaison ────────────────────────────────
 class CompareDialog(QDialog):
-    def __init__(self, left_path: str, right_path: str, parent=None):
+    def __init__(self, left_path, right_path, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Comparaison de MSBT")
         self.resize(1200, 700)
@@ -780,7 +774,7 @@ class CompareDialog(QDialog):
         except Exception as e:
             QMessageBox.critical(self, "Erreur", str(e))
 
-    def _highlight_diffs(self, left_text: str, right_text: str):
+    def _highlight_diffs(self, left_text, right_text):
         differ = difflib.Differ()
         diff = list(differ.compare(left_text.splitlines(), right_text.splitlines()))
         left_html = []
@@ -798,7 +792,7 @@ class CompareDialog(QDialog):
         self.left_edit.setHtml('<br>'.join(left_html))
         self.right_edit.setHtml('<br>'.join(right_html))
 
-# ─── Onglet éditeur amélioré ───────────────────────────────
+# ─── Onglet éditeur ─────────────────────────────────────────
 class EditorTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -847,7 +841,7 @@ class EditorTab(QWidget):
 
         self._image_widget = None
 
-    def load_direct(self, path: str):
+    def load_direct(self, path):
         self.file_path = path
         self.arc_path = None
         self.arc_int = None
@@ -858,7 +852,7 @@ class EditorTab(QWidget):
             return
         self._display(raw, Path(path).suffix)
 
-    def load_from_archive(self, arc_path: str, internal: str):
+    def load_from_archive(self, arc_path, internal):
         self.arc_path = arc_path
         self.arc_int = internal
         self.file_path = None
@@ -869,15 +863,13 @@ class EditorTab(QWidget):
             return
         self._display(raw, Path(internal).suffix)
 
-    def _display(self, raw: bytes, ext: str = ''):
-        # Nettoyer l'image précédente
+    def _display(self, raw, ext=''):
         if self._image_widget:
             self.layout().replaceWidget(self._image_widget, self.editor)
             self._image_widget.deleteLater()
             self._image_widget = None
             self.editor.show()
 
-        # Prévisualisation image
         if ext.lower() in ('.png', '.jpg', '.jpeg', '.dds'):
             try:
                 pix = QPixmap()
@@ -955,7 +947,7 @@ class EditorTab(QWidget):
             self._display(self.raw, Path(self.arc_int or self.file_path or '').suffix)
             self.btn_hex.setText("🔢 Hex")
 
-    def _build_output(self) -> bytes:
+    def _build_output(self):
         txt = self.editor.toPlainText()
         if self.mode == 'msbt' and self.msbt:
             self.msbt.from_txt(txt)
@@ -995,12 +987,12 @@ class EditorTab(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Erreur", str(e))
 
-    def is_modified(self) -> bool:
+    def is_modified(self):
         if self.mode in ('msbt', 'text'):
             return self.editor.toPlainText() != self._original_text
         return False
 
-    def prompt_save(self) -> int:
+    def prompt_save(self):
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Warning)
         box.setWindowTitle("Modifications non sauvegardées")
@@ -1008,7 +1000,7 @@ class EditorTab(QWidget):
         box.setStandardButtons(QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel)
         return box.exec_()
 
-    def tab_name(self) -> str:
+    def tab_name(self):
         return os.path.basename(self.arc_int or self.file_path or "sans nom")
 
     def _show_status(self, msg):
@@ -1016,7 +1008,7 @@ class EditorTab(QWidget):
         if hasattr(win, 'statusBar'):
             win.statusBar().showMessage(msg)
 
-# ─── Arbre de fichiers avec arborescence d'archives ────────
+# ─── Arbre de fichiers (corrigé) ────────────────────────────
 class FileTree(QTreeWidget):
     open_file = pyqtSignal(str)
     open_intern = pyqtSignal(str, str)
@@ -1037,20 +1029,22 @@ class FileTree(QTreeWidget):
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self._ctx_menu)
         self.itemDoubleClicked.connect(self._on_dclick)
+        # Connexion des deux types d'expansion
         self.itemExpanded.connect(self._on_expand)
+        self.itemExpanded.connect(self._on_expand_archive_folder)
         self.root_path = ''
 
-    def set_root(self, path: str):
+    def set_root(self, path):
         self.clear()
         self.root_path = path
         self._populate(self.invisibleRootItem(), path)
 
-    def load_single_archive(self, path: str):
+    def load_single_archive(self, path):
         self.clear()
         self.root_path = os.path.dirname(path)
         self._add_file_item(self.invisibleRootItem(), os.path.basename(path), path)
 
-    def _populate(self, parent: QTreeWidgetItem, path: str):
+    def _populate(self, parent, path):
         try:
             entries = sorted(os.listdir(path), key=lambda x: (not os.path.isdir(os.path.join(path, x)), x.lower()))
         except PermissionError:
@@ -1065,7 +1059,7 @@ class FileTree(QTreeWidget):
             else:
                 self._add_file_item(parent, name, full)
 
-    def _add_file_item(self, parent: QTreeWidgetItem, name: str, full: str):
+    def _add_file_item(self, parent, name, full):
         ext = Path(name).suffix.lower()
         icon = self.EXT_ICON.get(ext, '📄')
         size = os.path.getsize(full) if os.path.exists(full) else 0
@@ -1075,7 +1069,8 @@ class FileTree(QTreeWidget):
             item.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
             QTreeWidgetItem(item, ["…"])
 
-    def _on_expand(self, item: QTreeWidgetItem):
+    def _on_expand(self, item):
+        # Expansion des dossiers réels et des archives racines
         if item.childCount() == 1 and item.child(0).text(0) == "…":
             item.takeChildren()
             kind, path = item.data(0, Qt.UserRole)
@@ -1084,8 +1079,24 @@ class FileTree(QTreeWidget):
             elif kind == 'file':
                 self._load_archive_children(item, path)
 
-    def _load_archive_children(self, parent: QTreeWidgetItem, arc_path: str):
-        """Construit l'arborescence complète de l'archive."""
+    def _on_expand_archive_folder(self, item):
+        # Expansion des sous-dossiers d'archive
+        if item.childCount() == 1 and item.child(0).text(0) == "…":
+            kind, _ = item.data(0, Qt.UserRole)
+            if kind == 'archive_folder':
+                item.takeChildren()
+                # Trouver l'archive parente
+                parent = item.parent()
+                while parent:
+                    pdata = parent.data(0, Qt.UserRole)
+                    if pdata and pdata[0] == 'file':
+                        arc_path = pdata[1]
+                        internal_dir = self._get_internal_dir(item)
+                        self._load_archive_subfolder(item, arc_path, internal_dir)
+                        break
+                    parent = parent.parent()
+
+    def _load_archive_children(self, parent, arc_path):
         try:
             files = archive_list(arc_path)
             tree = {}
@@ -1104,40 +1115,24 @@ class FileTree(QTreeWidget):
                 for name, info in sorted(d.items()):
                     children = info['__children__']
                     fname = info['__file__']
-                    if fname is not None:  # fichier
+                    if fname is not None:
                         ext = Path(name).suffix.lower()
                         icon = self.EXT_ICON.get(ext, '📄')
                         child = QTreeWidgetItem(parent_item, [f"{icon} {name}", ""])
                         child.setData(0, Qt.UserRole, ('archive_file', arc_path, fname))
                         child.setToolTip(0, fname)
-                    else:  # dossier
+                    else:
                         folder_item = QTreeWidgetItem(parent_item, [f"📁 {name}", ""])
                         folder_item.setData(0, Qt.UserRole, ('archive_folder', arc_path, None))
                         folder_item.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
-                        QTreeWidgetItem(folder_item, ["…"])  # placeholder
+                        QTreeWidgetItem(folder_item, ["…"])
                         fill(folder_item, children)
             fill(parent, tree)
 
         except Exception as e:
             QTreeWidgetItem(parent, [f"⚠ {e}", ""])
 
-    def _on_expand_archive_folder(self, item: QTreeWidgetItem):
-        """Développe un sous-dossier d'archive."""
-        if item.childCount() == 1 and item.child(0).text(0) == "…":
-            item.takeChildren()
-            # Trouver l'archive parente
-            parent = item.parent()
-            while parent:
-                data = parent.data(0, Qt.UserRole)
-                if data and data[0] == 'file':
-                    arc_path = data[1]
-                    # Reconstruire le chemin interne du dossier
-                    internal_dir = self._get_internal_dir(item)
-                    self._load_archive_subfolder(item, arc_path, internal_dir)
-                    break
-                parent = parent.parent()
-
-    def _get_internal_dir(self, item: QTreeWidgetItem) -> str:
+    def _get_internal_dir(self, item):
         parts = []
         while item:
             data = item.data(0, Qt.UserRole)
@@ -1148,7 +1143,7 @@ class FileTree(QTreeWidget):
             item = item.parent()
         return '/'.join(reversed(parts)) + '/'
 
-    def _load_archive_subfolder(self, parent_item: QTreeWidgetItem, arc_path: str, internal_dir: str):
+    def _load_archive_subfolder(self, parent_item, arc_path, internal_dir):
         try:
             files = archive_list(arc_path)
             sub_files = [f for f in files if f.startswith(internal_dir)]
@@ -1185,20 +1180,6 @@ class FileTree(QTreeWidget):
 
         except Exception as e:
             QTreeWidgetItem(parent_item, [f"⚠ {e}", ""])
-
-    # Surcharge de l'événement d'expansion pour intercepter les dossiers d'archive
-    def event(self, e):
-        if e.type() == e.ChildAdded:
-            item = self.itemAt(e.pos())
-            if item and item.data(0, Qt.UserRole) and item.data(0, Qt.UserRole)[0] == 'archive_folder':
-                item.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
-        return super().event(e)
-
-    # Connexion manuelle pour les dossiers d'archive
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.itemExpanded.connect(self._on_expand)
-        self.itemExpanded.connect(self._on_expand_archive_folder)
 
     def _on_dclick(self, item, _col):
         data = item.data(0, Qt.UserRole)
@@ -1240,13 +1221,13 @@ class FileTree(QTreeWidget):
                 menu.addAction(f"📤 Exporter {len(msbt_items)} MSBT → TXT…").triggered.connect(lambda: self._batch_export_items(msbt_items))
         menu.exec_(self.viewport().mapToGlobal(pos))
 
-    def _compare_file(self, path: str):
+    def _compare_file(self, path):
         other, _ = QFileDialog.getOpenFileName(self, "Choisir un autre fichier MSBT", filter="*.msbt")
         if other:
             dlg = CompareDialog(path, other, self)
             dlg.exec_()
 
-    def _compare_archive_file(self, arc_path: str, internal: str):
+    def _compare_archive_file(self, arc_path, internal):
         tmp = tempfile.mkdtemp()
         tmp_file = os.path.join(tmp, os.path.basename(internal))
         try:
@@ -1304,7 +1285,7 @@ class FileTree(QTreeWidget):
         QMessageBox.information(self, "Export", f"{done} fichier(s) exporté(s).")
 
     @staticmethod
-    def _fmt_size(sz: int) -> str:
+    def _fmt_size(sz):
         for u in ('o', 'Ko', 'Mo', 'Go'):
             if sz < 1024:
                 return f"{sz:.0f} {u}"
@@ -1402,7 +1383,6 @@ class MainWindow(QMainWindow):
         btn_imp_lot.clicked.connect(self._batch_import)
         tb.addWidget(btn_imp_lot)
 
-        # Menu Fichier
         mb = self.menuBar()
         mf = mb.addMenu("Fichier")
         a_folder = QAction("Ouvrir dossier…", self)
@@ -1455,7 +1435,7 @@ class MainWindow(QMainWindow):
         else:
             self._open_tab_direct(path)
 
-    def _open_tab_direct(self, path: str):
+    def _open_tab_direct(self, path):
         for i in range(self.tabs.count()):
             tab = self.tabs.widget(i)
             if isinstance(tab, EditorTab) and tab.file_path == path:
@@ -1466,7 +1446,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(tab, os.path.basename(path))
         self.tabs.setCurrentWidget(tab)
 
-    def _open_tab_intern(self, arc_path: str, internal: str):
+    def _open_tab_intern(self, arc_path, internal):
         for i in range(self.tabs.count()):
             tab = self.tabs.widget(i)
             if isinstance(tab, EditorTab) and tab.arc_path == arc_path and tab.arc_int == internal:
@@ -1477,7 +1457,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(tab, os.path.basename(internal))
         self.tabs.setCurrentWidget(tab)
 
-    def _close_tab(self, idx: int):
+    def _close_tab(self, idx):
         tab = self.tabs.widget(idx)
         if isinstance(tab, EditorTab) and tab.is_modified():
             ret = tab.prompt_save()
@@ -1488,7 +1468,7 @@ class MainWindow(QMainWindow):
         self.tabs.removeTab(idx)
         tab.deleteLater()
 
-    def _change_game(self, name: str):
+    def _change_game(self, name):
         global current_game
         if name in GAMES:
             current_game = GAMES[name]
