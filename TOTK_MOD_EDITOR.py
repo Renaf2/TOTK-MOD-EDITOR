@@ -1,752 +1,1644 @@
 #!/usr/bin/env python3
-import sys, os, io, struct, fnmatch, tempfile, shutil, zipfile, tarfile
+# -*- coding: utf-8 -*-
+"""
+TOTK MOD EDITOR – Outil de modding tout-en-un pour Nintendo Switch
+Version 4.0 – Arborescence, prévisualisation, comparaison, sauvegarde sécurisée
+"""
+
+import sys, os, io, struct, fnmatch, tempfile, shutil, zipfile, tarfile, difflib
 from pathlib import Path
 from io import BytesIO
-import yaml
+from typing import Dict, List, Optional, Tuple
+
+# ─── Dépendances externes ─────────────────────────────────
+try:
+    import yaml
+    HAS_YAML = True
+except ImportError:
+    HAS_YAML = False
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QSplitter, QTreeWidget, QTreeWidgetItem, QTabWidget, QPlainTextEdit,
+    QSplitter, QTreeWidget, QTreeWidgetItem, QTabWidget, QTextEdit,
     QLineEdit, QPushButton, QLabel, QFileDialog, QMessageBox,
-    QToolBar, QStatusBar, QProgressDialog, QMenu, QHeaderView, QComboBox, QStyle
+    QToolBar, QStatusBar, QProgressDialog, QMenu, QHeaderView, QComboBox,
+    QStyle, QAbstractItemView, QAction, QDialog, QCheckBox,
+    QPlainTextEdit, QScrollArea
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QFont, QColor, QPalette
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt5.QtGui import (
+    QFont, QColor, QPalette, QTextCharFormat, QSyntaxHighlighter,
+    QTextCursor, QPixmap, QImage
+)
 
 import py7zr
 import zstandard as zstd
 
-# --------------------------------------------------------------------
-zstd_dictionary = None
-def set_zstd_dictionary(path):
-    global zstd_dictionary
-    with open(path,'rb') as f: zstd_dictionary = zstd.ZstdCompressionDict(f.read())
-def decompress_zs(data):
-    if zstd_dictionary: dctx = zstd.ZstdDecompressor(dict_data=zstd_dictionary)
-    else: dctx = zstd.ZstdDecompressor()
-    for method in [dctx.decompress, lambda d: dctx.decompress(d, max_output_size=100_000_000),
+# ─── Configuration des jeux ──────────────────────────────────
+class GameConfig:
+    def __init__(self, name: str, lbl1_slots: int = 101, hash_mult: int = 0x492,
+                 align: int = 16, langs: List[str] = None):
+        self.name = name
+        self.lbl1_slots = lbl1_slots
+        self.hash_mult = hash_mult
+        self.align = align
+        self.langs = langs or ["USen"]
+
+GAMES = {
+    "TotK": GameConfig("Tears of the Kingdom", 101, 0x492, 16,
+                       ["USen","EUfr","EUde","EUes","EUit","JPja","KRko","CNzh","TWzh"]),
+    "BotW": GameConfig("Breath of the Wild", 101, 0x492, 16,
+                       ["USen","EUfr","EUde","EUes","EUit","JPja","KRko","CNzh"]),
+    "LA": GameConfig("Link's Awakening", 101, 0x492, 16,
+                     ["USen","EUfr","EUde","EUes","EUit","JPja"]),
+}
+current_game = GAMES["TotK"]
+
+# ─── Dictionnaire Zstd ──────────────────────────────────────
+_zstd_dict = None
+
+def set_zstd_dict(path: str):
+    global _zstd_dict
+    with open(path, 'rb') as f:
+        _zstd_dict = zstd.ZstdCompressionDict(f.read())
+
+def decompress_zs(data: bytes) -> bytes:
+    dctx = zstd.ZstdDecompressor(dict_data=_zstd_dict) if _zstd_dict else zstd.ZstdDecompressor()
+    for method in [dctx.decompress,
+                   lambda d: dctx.decompress(d, max_output_size=200_000_000),
                    lambda d: dctx.stream_reader(BytesIO(d)).read()]:
         try: return method(data)
         except: pass
     return data
-def compress_zs(data):
-    if zstd_dictionary: cctx = zstd.ZstdCompressor(dict_data=zstd_dictionary)
-    else: cctx = zstd.ZstdCompressor()
+
+def compress_zs(data: bytes) -> bytes:
+    cctx = zstd.ZstdCompressor(dict_data=_zstd_dict) if _zstd_dict else zstd.ZstdCompressor()
     return cctx.compress(data)
 
-# --------------------------------------------------------------------
-class GameConfig:
-    def __init__(self, name="TotK", endian='<', align_bytes=16, section_padding=b'\x00', lbl1_num_slots=101, hash_mult=0x65, language_order=[]):
-        self.name=name; self.endian=endian; self.align_bytes=align_bytes; self.section_padding=section_padding
-        self.lbl1_num_slots=lbl1_num_slots; self.hash_mult=hash_mult; self.language_order=language_order
-GAMES = {
-    "TotK": GameConfig("Tears of the Kingdom", '<', 16, b'\x00', 101, 0x65, ["USen","EUfr","EUde","EUes","EUit","JPja","KRko","CNzh"]),
-    "BotW": GameConfig("Breath of the Wild", '<', 16, b'\x00', 101, 0x65, ["USen","EUfr","EUde","EUes","EUit","JPja","KRko","CNzh"]),
-    "Link's Awakening": GameConfig("Link's Awakening", '<', 16, b'\x00', 101, 0x65, ["USen","EUfr","EUde","EUes","EUit","JPja"]),
-}
-current_game_config = GAMES["TotK"]
-
-def is_probably_text(data):
-    if not data: return False
-    sample = data[:4096]; control=0
-    for b in sample:
-        if b==0: return False
-        if b<0x20 and b not in (9,10,13): control+=1
-    return (control/len(sample))<=0.1
-
-# --------------------------------------------------------------------
+# ─── Module SARC ────────────────────────────────────────────
 class SarcReader:
-    def __init__(self, data): self.data=data; self.stream=BytesIO(data); self.files={}; self._parse()
+    def __init__(self, data: bytes):
+        self.data = data
+        self.stream = BytesIO(data)
+        self.files = {}
+        self._parse()
+
     def _parse(self):
-        magic=self.stream.read(4)
-        if magic!=b'SARC': raise ValueError("Not a SARC")
-        header_size=struct.unpack('<H', self.stream.read(2))[0]
-        bom=struct.unpack('<H', self.stream.read(2))[0]
-        if bom not in (0xFFFE,0xFEFF): raise ValueError(f"BOM: {hex(bom)}")
-        file_size=struct.unpack('<I', self.stream.read(4))[0]
-        data_offset=struct.unpack('<I', self.stream.read(4))[0]
-        self.stream.read(4)
-        magic2=self.stream.read(4)
-        if magic2!=b'SFAT': raise ValueError("SFAT not found")
-        pos_backup=self.stream.tell()
-        sfat_size=struct.unpack('<I', self.stream.read(4))[0]
-        file_count=struct.unpack('<I', self.stream.read(4))[0]
-        if sfat_size<12 or file_count>100000:
-            self.stream.seek(pos_backup)
-            sfat_size=struct.unpack('<H', self.stream.read(2))[0]
-            file_count=struct.unpack('<H', self.stream.read(2))[0]
-        hash_multiplier=struct.unpack('<I', self.stream.read(4))[0]
-        entries=[]
-        for _ in range(file_count):
-            name_hash=struct.unpack('<I', self.stream.read(4))[0]
-            name_info=struct.unpack('<I', self.stream.read(4))[0]
-            file_start=struct.unpack('<I', self.stream.read(4))[0]
-            file_end=struct.unpack('<I', self.stream.read(4))[0]
-            name_offset=(name_info & 0xFFFF)*4
-            entries.append((name_offset, file_start+data_offset, file_end+data_offset))
-        magic3=self.stream.read(4)
-        if magic3!=b'SFNT': raise ValueError("SFNT not found")
-        sfnt_size=struct.unpack('<I', self.stream.read(4))[0]
-        sfnt_start=self.stream.tell()
-        name_block=self.stream.read(sfnt_size)
-        for name_offset,start,end in entries:
-            self.stream.seek(sfnt_start+name_offset)
-            name_bytes=b''
+        s = self.stream
+        if s.read(4) != b'SARC':
+            raise ValueError("Not a SARC archive")
+        s.read(2)  # header_size
+        bom = struct.unpack('<H', s.read(2))[0]
+        if bom not in (0xFFFE, 0xFEFF):
+            raise ValueError(f"Bad BOM: {hex(bom)}")
+        s.read(4)  # file_size
+        data_offset = struct.unpack('<I', s.read(4))[0]
+        s.read(4)  # version + reserved
+
+        if s.read(4) != b'SFAT':
+            raise ValueError("SFAT not found")
+        pos = s.tell()
+        sfat_hdr = struct.unpack('<H', s.read(2))[0]
+        file_cnt = struct.unpack('<H', s.read(2))[0]
+        if sfat_hdr < 8 or file_cnt > 100000:
+            s.seek(pos)
+            sfat_hdr = struct.unpack('<I', s.read(4))[0]
+            file_cnt = struct.unpack('<I', s.read(4))[0]
+        s.read(4)  # hash multiplier
+
+        entries = []
+        for _ in range(file_cnt):
+            s.read(4)  # name_hash
+            name_info = struct.unpack('<I', s.read(4))[0]
+            file_start = struct.unpack('<I', s.read(4))[0]
+            file_end = struct.unpack('<I', s.read(4))[0]
+            name_off = (name_info & 0xFFFF) * 4
+            entries.append((name_off, file_start + data_offset, file_end + data_offset))
+
+        if s.read(4) != b'SFNT':
+            raise ValueError("SFNT not found")
+        sfnt_size = struct.unpack('<I', s.read(4))[0]
+        sfnt_base = s.tell()
+
+        for name_off, start, end in entries:
+            s.seek(sfnt_base + name_off)
+            name_bytes = b''
             while True:
-                b=self.stream.read(1)
-                if not b or b==b'\x00': break
-                name_bytes+=b
-            name=name_bytes.decode('utf-8',errors='replace')
-            if start<=end<=len(self.data): self.files[name]=self.data[start:end]
-    def list_files(self): return list(self.files.keys())
-    def get_file(self,name): return self.files.get(name)
+                b = s.read(1)
+                if not b or b == b'\x00':
+                    break
+                name_bytes += b
+            name = name_bytes.decode('utf-8', errors='replace')
+            if start <= end <= len(self.data):
+                self.files[name] = self.data[start:end]
+
+    def list_files(self) -> List[str]:
+        return list(self.files.keys())
+
+    def get_file(self, name: str) -> bytes:
+        return self.files.get(name, b'')
+
 
 class SarcWriter:
-    def __init__(self): self.files=[]
-    def add_file(self,name,data): self.files.append((name,data))
-    def _hash(self,name,mult=0x65):
-        res=0
-        for c in name.encode(): res=(res*mult+c)&0xFFFFFFFF
-        return res
-    def save(self):
-        self.files.sort(key=lambda x: self._hash(x[0]))
-        out=BytesIO(); fc=len(self.files)
-        name_offsets={}; name_block=BytesIO()
-        for name,_ in self.files:
+    def __init__(self):
+        self.entries = []  # list of (name, data)
+
+    def add_file(self, name: str, data: bytes):
+        self.entries.append((name, data))
+
+    @staticmethod
+    def _hash(name: str, mult: int = 0x65) -> int:
+        h = 0
+        for c in name.encode('utf-8'):
+            h = (h * mult + c) & 0xFFFFFFFF
+        return h
+
+    def save(self) -> bytes:
+        self.entries.sort(key=lambda x: self._hash(x[0]))
+        fc = len(self.entries)
+
+        name_offsets = {}
+        name_block = BytesIO()
+        for name, _ in self.entries:
             if name not in name_offsets:
-                name_offsets[name]=name_block.tell()//4
-                enc=name.encode()+b'\x00'
+                name_offsets[name] = name_block.tell() // 4
+                enc = name.encode('utf-8') + b'\x00'
                 name_block.write(enc)
-                pad=(4-(name_block.tell()%4))%4
-                name_block.write(b'\x00'*pad)
-        name_data=name_block.getvalue()
-        data_positions=[]; data_block=BytesIO()
-        for _,data in self.files:
-            start=data_block.tell()
+                pad = (4 - (name_block.tell() % 4)) % 4
+                if pad:
+                    name_block.write(b'\x00' * pad)
+        name_data = name_block.getvalue()
+
+        data_positions = []
+        data_block = BytesIO()
+        for _, data in self.entries:
+            start = data_block.tell()
             data_block.write(data)
-            end=data_block.tell()
-            data_positions.append((start,end))
-            pad=(4-(end%4))%4
-            if pad: data_block.write(b'\x00'*pad)
-        data_data=data_block.getvalue()
-        sfat_size=12+fc*16; sfnt_size=8+len(name_data)
-        data_offset=0x14+sfat_size+sfnt_size
-        data_offset=(data_offset+0xFF)&~0xFF
-        total_size=data_offset+len(data_data)
+            end = data_block.tell()
+            data_positions.append((start, end))
+            pad = (4 - (end % 4)) % 4
+            if pad:
+                data_block.write(b'\x00' * pad)
+        data_data = data_block.getvalue()
+
+        sfat_size = 12 + fc * 16
+        sfnt_size = 8 + len(name_data)
+        data_offset = 0x14 + sfat_size + sfnt_size
+        data_offset = (data_offset + 0xFF) & ~0xFF
+        total_size = data_offset + len(data_data)
+
+        out = BytesIO()
         out.write(b'SARC')
-        out.write(struct.pack('<H',0x14)); out.write(struct.pack('<H',0xFFFE))
-        out.write(struct.pack('<I',total_size)); out.write(struct.pack('<I',data_offset))
-        out.write(struct.pack('<H',0x0100)); out.write(struct.pack('<H',0))
-        out.write(b'SFAT'); out.write(struct.pack('<I',sfat_size)); out.write(struct.pack('<I',fc))
-        out.write(struct.pack('<I',0x65))
-        for i,(name,data) in enumerate(self.files):
-            s,e=data_positions[i]
-            out.write(struct.pack('<I',self._hash(name)))
-            out.write(struct.pack('<I',(name_offsets[name]&0xFFFF)|0x01000000))
-            out.write(struct.pack('<I',s)); out.write(struct.pack('<I',e))
-        out.write(b'SFNT'); out.write(struct.pack('<I',sfnt_size))
+        out.write(struct.pack('<H', 0x14))
+        out.write(struct.pack('<H', 0xFFFE))
+        out.write(struct.pack('<I', total_size))
+        out.write(struct.pack('<I', data_offset))
+        out.write(struct.pack('<H', 0x0100))
+        out.write(struct.pack('<H', 0x0000))
+
+        out.write(b'SFAT')
+        out.write(struct.pack('<H', sfat_size))
+        out.write(struct.pack('<H', fc))
+        out.write(struct.pack('<I', 0x65))
+
+        for i, (name, _) in enumerate(self.entries):
+            s, e = data_positions[i]
+            out.write(struct.pack('<I', self._hash(name)))
+            out.write(struct.pack('<I', (name_offsets[name] & 0xFFFF) | 0x01000000))
+            out.write(struct.pack('<I', s))
+            out.write(struct.pack('<I', e))
+
+        out.write(b'SFNT')
+        out.write(struct.pack('<I', sfnt_size))
         out.write(name_data)
-        cur=out.tell()
-        if cur<data_offset: out.write(b'\x00'*(data_offset-cur))
+
+        cur = out.tell()
+        if cur < data_offset:
+            out.write(b'\x00' * (data_offset - cur))
         out.write(data_data)
         return out.getvalue()
 
-# --------------------------------------------------------------------
+# ─── Module MSBT ────────────────────────────────────────────
 class MsbtParser:
-    def __init__(self, data, game_config=None):
-        self.data=data; self.stream=BytesIO(data); self.entries={}; self.labels_order=[]; self.languages=[]
-        self.game=game_config or current_game_config
+    MAGIC = b'MsgStdBn'
+
+    def __init__(self, data: bytes, game_cfg: GameConfig = None):
+        self.raw = data
+        self.game = game_cfg or current_game
+        self.labels = []
+        self.texts = {}
         self._parse()
+
     def _parse(self):
-        stream=self.stream
-        magic=stream.read(8)
-        if magic!=b'MsgStdBn': raise ValueError("Not MSBT")
-        stream.read(2); stream.read(2)
-        section_count=struct.unpack('<H', stream.read(2))[0]
-        stream.read(2); stream.read(4); stream.read(10)
-        labels=[]; texts_by_lang=[]; lang_names=[]
+        s = BytesIO(self.raw)
+        if s.read(8) != self.MAGIC:
+            raise ValueError("Not a MSBT file")
+        bom = s.read(2)
+        self.enc = 'utf-16-be' if bom == b'\xFE\xFF' else 'utf-16-le'
+        s.read(2)
+        section_count = struct.unpack('<H', s.read(2))[0]
+        s.read(2)
+        s.read(4)
+        s.read(10)
+
+        lbl_map = {}
+        all_texts = []
+
         for _ in range(section_count):
-            pos=stream.tell()
-            align=(self.game.align_bytes - (pos % self.game.align_bytes)) % self.game.align_bytes
-            if align: stream.read(align)
-            sec_magic=stream.read(4)
-            if not sec_magic: break
-            sec_size=struct.unpack('<I', stream.read(4))[0]
-            stream.read(8); sec_start=stream.tell()
-            if sec_magic==b'LBL1':
-                num_slots=struct.unpack('<I', stream.read(4))[0]
-                for _ in range(num_slots): stream.read(8)
-                while stream.tell()<sec_start+sec_size:
-                    length=struct.unpack('B', stream.read(1))[0]
-                    if length==0: break
-                    name=stream.read(length).decode('utf-8',errors='replace')
-                    index=struct.unpack('<I', stream.read(4))[0]
-                    labels.append((index,name))
-                labels.sort(key=lambda x:x[0])
-                self.labels_order=[lbl for _,lbl in labels]
-            elif sec_magic==b'ATR1':
-                num_langs=struct.unpack('<I', stream.read(4))[0]
-                lang_offsets=[struct.unpack('<I', stream.read(4))[0] for _ in range(num_langs)]
-                for off in lang_offsets:
-                    stream.seek(sec_start+off)
-                    lang_bytes=b''
-                    while True:
-                        b=stream.read(1)
-                        if not b or b==0: break
-                        lang_bytes+=b
-                    lang_names.append(lang_bytes.decode('utf-8',errors='replace'))
-                self.languages=lang_names
-            elif sec_magic==b'TXT2':
-                num_strings=struct.unpack('<I', stream.read(4))[0]
-                offsets=[struct.unpack('<I', stream.read(4))[0] for _ in range(num_strings)]
-                texts=[]
-                for off in offsets:
-                    stream.seek(sec_start+4+num_strings*4+off)
-                    chars=[]
-                    while True:
-                        raw=stream.read(2)
-                        if len(raw)<2: break
-                        cp=struct.unpack('<H',raw)[0]
-                        if cp==0: break
-                        try: chars.append(chr(cp))
-                        except: chars.append(f'<{cp:04X}>')
-                    texts.append(''.join(chars))
-                texts_by_lang.append(texts)
-            stream.seek(sec_start+sec_size)
-        if not lang_names: lang_names=["USen"]
-        self.languages=lang_names
-        for lang_idx,lang_texts in enumerate(texts_by_lang):
-            lang=lang_names[lang_idx] if lang_idx<len(lang_names) else f"lang_{lang_idx}"
-            for text_idx,text in enumerate(lang_texts):
-                if text_idx<len(labels):
-                    label=labels[text_idx][1]
-                    if label not in self.entries: self.entries[label]={}
-                    self.entries[label][lang]=text
-    def to_text(self):
-        lines=[]
-        for label in self.labels_order:
-            entry=self.entries.get(label,{})
-            if entry:
-                lines.append(f"[{label}]")
-                for lang,text in entry.items(): lines.append(f"{lang}: {text}")
-                lines.append("")
-        return "\n".join(lines)
-    def to_yaml(self):
-        data={}
-        for label in self.labels_order:
-            entry=self.entries.get(label,{})
-            if entry: data[label]=entry
-        return yaml.dump(data, allow_unicode=True, sort_keys=False)
-    def from_yaml(self, yaml_str):
-        data=yaml.safe_load(yaml_str)
-        for label,translations in data.items():
-            self.entries[label]=translations
-            if label not in self.labels_order: self.labels_order.append(label)
-    def update_from_text(self, text_str):
-        current_label=None
-        for line in text_str.splitlines():
-            line=line.strip()
-            if not line: current_label=None; continue
-            if line.startswith("[") and line.endswith("]"): current_label=line[1:-1]; continue
-            if current_label and ":" in line:
-                lang,value=line.split(":",1)
-                lang=lang.strip(); value=value.strip()
-                if current_label not in self.entries: self.entries[current_label]={}
-                self.entries[current_label][lang]=value
-    def save(self):
-        out=BytesIO()
-        cfg=self.game
-        all_langs=set()
-        for entry in self.entries.values():
-            for lang in entry: all_langs.add(lang)
-        if not all_langs: all_langs={"USen"}
-        ordered_langs=[]
-        for lang in cfg.language_order:
-            if lang in all_langs: ordered_langs.append(lang)
-        remaining=sorted(all_langs-set(ordered_langs))
-        ordered_langs.extend(remaining)
-        num_labels=len(self.labels_order)
-        lang_texts={lang:[] for lang in ordered_langs}
-        for label in self.labels_order:
-            entry=self.entries.get(label,{})
-            for lang in ordered_langs: lang_texts[lang].append(entry.get(lang,""))
-        out.write(b'MsgStdBn'); out.write(b'\xFF\xFE'); out.write(b'\x00\x00')
-        num_sections=2+len(ordered_langs)
-        out.write(struct.pack('<H', num_sections)); out.write(b'\x00\x00')
-        size_pos=out.tell(); out.write(struct.pack('<I',0)); out.write(b'\x00'*10)
-        def write_section(magic,content):
-            pos=out.tell()
-            align=(cfg.align_bytes-(pos%cfg.align_bytes))%cfg.align_bytes
-            out.write(cfg.section_padding*align)
-            out.write(magic); out.write(struct.pack('<I',len(content)))
-            out.write(cfg.section_padding*8); out.write(content)
+            pos = s.tell()
+            align = (self.game.align - (pos % self.game.align)) % self.game.align
+            if align:
+                s.read(align)
+            magic = s.read(4)
+            if not magic:
+                break
+            sec_size = struct.unpack('<I', s.read(4))[0]
+            s.read(8)
+            sec_start = s.tell()
+
+            if magic == b'LBL1':
+                lbl_map = self._read_lbl1(s, sec_start, sec_size)
+            elif magic == b'TXT2':
+                all_texts = self._read_txt2(s, sec_start, sec_size)
+            else:
+                s.read(sec_size)
+            s.seek(sec_start + sec_size)
+
+        for idx, label in sorted(lbl_map.items()):
+            self.labels.append(label)
+            self.texts[label] = all_texts[idx] if idx < len(all_texts) else ''
+
+    def _read_lbl1(self, s, sec_start, sec_size):
+        num_slots = struct.unpack('<I', s.read(4))[0]
+        slots = []
+        for _ in range(num_slots):
+            count = struct.unpack('<I', s.read(4))[0]
+            offset = struct.unpack('<I', s.read(4))[0]
+            slots.append((count, offset))
+        base = sec_start + 4 + num_slots * 8
+        result = {}
+        for count, offset in slots:
+            if count == 0:
+                continue
+            s.seek(base + offset)
+            for _ in range(count):
+                llen = struct.unpack('B', s.read(1))[0]
+                label = s.read(llen).decode('utf-8', errors='replace')
+                idx = struct.unpack('<I', s.read(4))[0]
+                result[idx] = label
+        return result
+
+    def _read_txt2(self, s, sec_start, sec_size):
+        num = struct.unpack('<I', s.read(4))[0]
+        offsets = [struct.unpack('<I', s.read(4))[0] for _ in range(num)]
+        base = sec_start + 4 + num * 4
+        texts = []
+        for off in offsets:
+            s.seek(base + off)
+            chars = []
+            while True:
+                raw2 = s.read(2)
+                if len(raw2) < 2:
+                    break
+                cp = struct.unpack('<H', raw2)[0]
+                if cp == 0:
+                    break
+                if cp == 0x000E:  # tag début
+                    grp = struct.unpack('<H', s.read(2))[0]
+                    typ = struct.unpack('<H', s.read(2))[0]
+                    dsz = struct.unpack('<H', s.read(2))[0]
+                    dat = s.read(dsz)
+                    chars.append(f'<tag grp={grp} typ={typ} data={dat.hex()}>')
+                elif cp == 0x000F:  # tag fin
+                    chars.append('</tag>')
+                else:
+                    try:
+                        chars.append(chr(cp))
+                    except:
+                        chars.append(f'<{cp:04X}>')
+            texts.append(''.join(chars))
+        return texts
+
+    def to_txt(self) -> str:
+        lines = []
+        for label in self.labels:
+            lines.append(f'[{label}]')
+            lines.append(self.texts.get(label, ''))
+            lines.append('---')
+        return '\n'.join(lines)
+
+    def from_txt(self, txt: str):
+        current = None
+        buf = []
+        for line in txt.splitlines():
+            if line.startswith('[') and line.endswith(']') and len(line) > 2:
+                if current is not None and current in self.texts:
+                    self.texts[current] = '\n'.join(buf)
+                current = line[1:-1]
+                buf = []
+            elif line == '---':
+                if current is not None and current in self.texts:
+                    self.texts[current] = '\n'.join(buf)
+                current = None
+                buf = []
+            else:
+                if current is not None:
+                    buf.append(line)
+        if current is not None and current in self.texts:
+            self.texts[current] = '\n'.join(buf)
+
+    def save(self) -> bytes:
+        cfg = self.game
+        out = BytesIO()
+        out.write(self.MAGIC)
+        out.write(b'\xFF\xFE')
+        out.write(b'\x00\x00')
+        out.write(struct.pack('<H', 2))  # LBL1 + TXT2
+        out.write(b'\x00\x00')
+        size_pos = out.tell()
+        out.write(struct.pack('<I', 0))
+        out.write(b'\x00' * 10)
+
+        def align():
+            pos = out.tell()
+            pad = (cfg.align - (pos % cfg.align)) % cfg.align
+            if pad:
+                out.write(b'\x00' * pad)
+
+        def write_section(magic, body):
+            align()
+            out.write(magic)
+            out.write(struct.pack('<I', len(body)))
+            out.write(b'\x00' * 8)
+            out.write(body)
+
         # LBL1
-        lbl_body=BytesIO(); slots=[[] for _ in range(cfg.lbl1_num_slots)]
-        for i,label in enumerate(self.labels_order):
-            h=0
-            for c in label.encode('utf-8'): h=(h*cfg.hash_mult+c)&0xFFFFFFFF
-            slots[h%cfg.lbl1_num_slots].append((label,i))
-        lbl_body.write(struct.pack('<I',cfg.lbl1_num_slots))
-        label_block=BytesIO()
+        lbl_body = BytesIO()
+        slots = [[] for _ in range(cfg.lbl1_slots)]
+        for idx, label in enumerate(self.labels):
+            h = 0
+            for c in label.encode('utf-8'):
+                h = (h * cfg.hash_mult + c) & 0xFFFFFFFF
+            slots[h % cfg.lbl1_slots].append((label, idx))
+
+        lbl_body.write(struct.pack('<I', cfg.lbl1_slots))
+        lbl_block = BytesIO()
         for slot in slots:
-            lbl_body.write(struct.pack('<I',len(slot)))
-            lbl_body.write(struct.pack('<I',label_block.tell()))
-            for label,idx in slot:
-                enc=label.encode('utf-8')
-                label_block.write(struct.pack('B',len(enc)))
-                label_block.write(enc); label_block.write(struct.pack('<I',idx))
-        lbl_body.write(label_block.getvalue())
+            lbl_body.write(struct.pack('<I', len(slot)))
+            lbl_body.write(struct.pack('<I', lbl_block.tell()))
+            for label, idx in slot:
+                enc = label.encode('utf-8')
+                lbl_block.write(struct.pack('B', len(enc)))
+                lbl_block.write(enc)
+                lbl_block.write(struct.pack('<I', idx))
+        lbl_body.write(lbl_block.getvalue())
         write_section(b'LBL1', lbl_body.getvalue())
-        # ATR1
-        atr_body=BytesIO(); atr_body.write(struct.pack('<I',len(ordered_langs)))
-        name_offsets=[4+len(ordered_langs)*4]
-        for i in range(1,len(ordered_langs)):
-            name_offsets.append(name_offsets[i-1]+len(ordered_langs[i-1].encode('utf-8'))+1)
-        for off in name_offsets: atr_body.write(struct.pack('<I',off))
-        for lang in ordered_langs: atr_body.write(lang.encode('utf-8')+b'\x00')
-        write_section(b'ATR1', atr_body.getvalue())
+
         # TXT2
-        for lang in ordered_langs:
-            txt_body=BytesIO(); txt_body.write(struct.pack('<I',num_labels))
-            texts=lang_texts[lang]; offsets=[0]
-            for i in range(1,num_labels):
-                offsets.append(offsets[i-1]+len(texts[i-1].encode('utf-16-le'))+2)
-            for off in offsets: txt_body.write(struct.pack('<I',off))
-            for text in texts:
-                enc=text.encode('utf-16-le')+b'\x00\x00'
-                txt_body.write(enc)
-            write_section(b'TXT2', txt_body.getvalue())
-        total=out.tell(); out.seek(size_pos); out.write(struct.pack('<I',total))
+        strings = []
+        for label in self.labels:
+            text = self.texts.get(label, '')
+            strings.append(self._encode_text(text))
+
+        txt_body = BytesIO()
+        txt_body.write(struct.pack('<I', len(strings)))
+        cur_off = 0
+        for enc in strings:
+            txt_body.write(struct.pack('<I', cur_off))
+            cur_off += len(enc)
+        for enc in strings:
+            txt_body.write(enc)
+        write_section(b'TXT2', txt_body.getvalue())
+
+        total = out.tell()
+        out.seek(size_pos)
+        out.write(struct.pack('<I', total))
         return out.getvalue()
 
-# --------------------------------------------------------------------
-class ArchiveManager:
-    @staticmethod
-    def list_archive_files(path):
-        ext=Path(path).suffix.lower()
-        if ext=='.zip':
-            with zipfile.ZipFile(path) as z: return [i.filename for i in z.infolist() if not i.is_dir()]
-        elif ext=='.7z':
-            with py7zr.SevenZipFile(path,'r') as sz: return sz.getnames()
-        elif ext in ('.tar','.gz','.bz2','.xz'):
-            with tarfile.open(path) as t: return [m.name for m in t.getmembers() if m.isfile()]
-        elif ext=='.sarc':
-            with open(path,'rb') as f: return SarcReader(f.read()).list_files()
-        elif ext=='.zs':
-            with open(path,'rb') as f: raw=f.read()
-            dec=decompress_zs(raw)
-            if dec[:4]==b'SARC': return SarcReader(dec).list_files()
+    def _encode_text(self, text: str) -> bytes:
+        out = BytesIO()
+        i = 0
+        while i < len(text):
+            if text[i:i+5] == '<tag ':
+                end = text.find('>', i)
+                if end != -1:
+                    try:
+                        parts = {}
+                        for tok in text[i+5:end].split():
+                            k, v = tok.split('=', 1)
+                            parts[k] = v
+                        grp = int(parts.get('grp', '0'))
+                        typ = int(parts.get('typ', '0'))
+                        dat = bytes.fromhex(parts.get('data', ''))
+                        out.write(struct.pack('<H', 0x000E))
+                        out.write(struct.pack('<H', grp))
+                        out.write(struct.pack('<H', typ))
+                        out.write(struct.pack('<H', len(dat)))
+                        out.write(dat)
+                    except:
+                        pass
+                    i = end + 1
+                    continue
+            if text[i:i+6] == '</tag>':
+                out.write(struct.pack('<H', 0x000F))
+                i += 6
+                continue
+            out.write(struct.pack('<H', ord(text[i])))
+            i += 1
+        out.write(b'\x00\x00')
+        return out.getvalue()
+
+# ─── Utilitaires fichiers/archives ──────────────────────────
+def read_file(path: str) -> bytes:
+    with open(path, 'rb') as f:
+        return f.read()
+
+def archive_list(path: str) -> List[str]:
+    ext = Path(path).suffix.lower()
+    try:
+        if ext == '.zip':
+            with zipfile.ZipFile(path) as z:
+                return [i.filename for i in z.infolist() if not i.is_dir()]
+        elif ext == '.7z':
+            with py7zr.SevenZipFile(path, 'r') as sz:
+                return sz.getnames()
+        elif ext in ('.tar', '.gz', '.bz2', '.xz'):
+            with tarfile.open(path) as t:
+                return [m.name for m in t.getmembers() if m.isfile()]
+        elif ext == '.sarc':
+            return SarcReader(read_file(path)).list_files()
+        elif ext == '.zs':
+            dec = decompress_zs(read_file(path))
+            if dec[:4] == b'SARC':
+                return SarcReader(dec).list_files()
             return [Path(path).stem]
+    except:
         return []
 
-    @staticmethod
-    def extract_file(archive_path, internal_name, dest_path):
-        ext=Path(archive_path).suffix.lower(); parent=os.path.dirname(dest_path)
-        if parent: os.makedirs(parent,exist_ok=True)
-        if ext=='.zip':
-            with zipfile.ZipFile(archive_path) as z:
-                with open(dest_path,'wb') as f: f.write(z.read(internal_name))
-        elif ext=='.7z':
-            with py7zr.SevenZipFile(archive_path,'r') as sz:
-                sz.extract(targets=[internal_name],path=parent)
-            extracted=os.path.join(parent,internal_name)
-            if extracted!=dest_path and os.path.exists(extracted): shutil.move(extracted,dest_path)
-        elif ext in ('.tar','.gz','.bz2','.xz'):
-            with tarfile.open(archive_path) as t:
-                f=t.extractfile(t.getmember(internal_name))
-                with open(dest_path,'wb') as out: out.write(f.read())
-        elif ext=='.sarc':
-            arc=SarcReader(open(archive_path,'rb').read())
-            with open(dest_path,'wb') as f: f.write(arc.get_file(internal_name))
-        elif ext=='.zs':
-            with open(archive_path,'rb') as f: raw=f.read()
-            dec=decompress_zs(raw)
-            if dec[:4]==b'SARC':
-                sarc=SarcReader(dec)
-                with open(dest_path,'wb') as f: f.write(sarc.get_file(internal_name))
-            else:
-                with open(dest_path,'wb') as f: f.write(dec)
+def archive_extract(arc_path: str, internal: str) -> bytes:
+    ext = Path(arc_path).suffix.lower()
+    if ext == '.zip':
+        with zipfile.ZipFile(arc_path) as z:
+            return z.read(internal)
+    elif ext == '.7z':
+        with py7zr.SevenZipFile(arc_path, 'r') as sz:
+            return sz.read([internal])[internal].read()
+    elif ext in ('.tar', '.gz', '.bz2', '.xz'):
+        with tarfile.open(arc_path) as t:
+            return t.extractfile(t.getmember(internal)).read()
+    elif ext == '.sarc':
+        return SarcReader(read_file(arc_path)).get_file(internal)
+    elif ext == '.zs':
+        dec = decompress_zs(read_file(arc_path))
+        if dec[:4] == b'SARC':
+            return SarcReader(dec).get_file(internal)
+        return dec
+    return b''
 
-    @staticmethod
-    def update_archive(archive_path, internal_name, new_file_path):
-        ext=Path(archive_path).suffix.lower()
-        if ext=='.zip':
-            tmp=tempfile.mkdtemp()
-            try:
-                with zipfile.ZipFile(archive_path) as z: z.extractall(tmp)
-                dst=os.path.join(tmp,internal_name)
-                os.makedirs(os.path.dirname(dst),exist_ok=True); shutil.copy2(new_file_path,dst)
-                base=archive_path[:-4]
-                if os.path.exists(archive_path): os.remove(archive_path)
-                shutil.make_archive(base,'zip',tmp)
-            finally: shutil.rmtree(tmp,ignore_errors=True)
-        elif ext=='.sarc':
-            arc=SarcReader(open(archive_path,'rb').read()); writer=SarcWriter()
-            new_data=open(new_file_path,'rb').read()
-            for fname in arc.list_files():
-                if fname==internal_name: writer.add_file(fname,new_data)
-                else: writer.add_file(fname,arc.get_file(fname))
-            with open(archive_path,'wb') as f: f.write(writer.save())
-        elif ext=='.zs':
-            with open(archive_path,'rb') as f: raw=f.read()
-            dec=decompress_zs(raw)
-            if dec[:4]==b'SARC':
-                arc=SarcReader(dec); writer=SarcWriter()
-                new_data=open(new_file_path,'rb').read()
-                for fname in arc.list_files():
-                    if fname==internal_name: writer.add_file(fname,new_data)
-                    else: writer.add_file(fname,arc.get_file(fname))
-                sarc_bytes=writer.save()
-                with open(archive_path,'wb') as f: f.write(compress_zs(sarc_bytes))
-            else:
-                new_data=open(new_file_path,'rb').read()
-                with open(archive_path,'wb') as f: f.write(compress_zs(new_data))
-
-# --------------------------------------------------------------------
-class FileTreeWidget(QTreeWidget):
-    open_file_signal=pyqtSignal(str)
-    def __init__(self,parent=None):
-        super().__init__(parent)
-        self.setHeaderLabels(["Nom","Taille"]); self.header().setSectionResizeMode(0,QHeaderView.Stretch)
-        self.setContextMenuPolicy(Qt.CustomContextMenu); self.customContextMenuRequested.connect(self._context_menu)
-        self.itemDoubleClicked.connect(self._on_double_click); self.itemExpanded.connect(self._on_expand)
-        self.root_path=""
-    def set_root(self,root_dir):
-        self.clear(); self.root_path=root_dir; self._populate(self.invisibleRootItem(),root_dir)
-    def _populate(self,parent_item,path):
-        try: items=sorted(os.listdir(path),key=lambda x:(not os.path.isdir(os.path.join(path,x)),x.lower()))
-        except PermissionError: return
-        for name in items:
-            full=os.path.join(path,name)
-            if os.path.isdir(full):
-                folder_item=QTreeWidgetItem(parent_item,[name,""])
-                folder_item.setData(0,Qt.UserRole,("folder",full))
-                folder_item.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
-                self._add_dummy_child(folder_item)
-            else:
-                size=os.path.getsize(full)
-                item=QTreeWidgetItem(parent_item,[name,self._format_size(size)])
-                item.setData(0,Qt.UserRole,("file",full)); self._set_icon(item,full)
-    def _add_dummy_child(self,item):
-        dummy=QTreeWidgetItem(item,["Chargement..."]); item.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
-    def _on_expand(self,item):
-        if item.childCount()==1 and item.child(0).text(0)=="Chargement...":
-            item.removeChild(item.child(0))
-            path=item.data(0,Qt.UserRole)[1]; self._populate(item,path)
-    def _on_double_click(self,item,col):
-        kind,path=item.data(0,Qt.UserRole)
-        if kind=="file":
-            ext=os.path.splitext(path)[1].lower()
-            if ext in ('.zip','.7z','.sarc','.zs','.tar','.gz','.bz2','.xz'):
-                self._load_archive_content(item,path)
-            else: self.open_file_signal.emit(path)
-        elif kind=="archive_file":
-            archive_path=item.parent().data(0,Qt.UserRole)[1]; internal_name=path
-            tmp=tempfile.mkdtemp(); dest=os.path.join(tmp,os.path.basename(internal_name))
-            try:
-                ArchiveManager.extract_file(archive_path,internal_name,dest); self.open_file_signal.emit(dest)
-            except Exception as e: QMessageBox.critical(self,"Erreur",str(e))
-    def _load_archive_content(self,item,archive_path):
-        if item.childCount()>0 and item.child(0).data(0,Qt.UserRole) is not None: return
-        item.takeChildren()
+def archive_update(arc_path: str, internal: str, new_data: bytes):
+    ext = Path(arc_path).suffix.lower()
+    if ext == '.zip':
+        tmp = tempfile.mkdtemp()
         try:
-            files=ArchiveManager.list_archive_files(archive_path)
-            for f in files:
-                child=QTreeWidgetItem(item,[f,""]); child.setData(0,Qt.UserRole,("archive_file",f))
-                child.setIcon(0,self.style().standardIcon(QStyle.SP_FileIcon))
-        except Exception as e: QMessageBox.critical(self,"Erreur",str(e))
-    def _context_menu(self,pos):
-        item=self.itemAt(pos)
-        if not item: return
-        kind,path=item.data(0,Qt.UserRole); menu=QMenu()
-        if kind=="file":
-            action_open=menu.addAction("Ouvrir"); action_open.triggered.connect(lambda: self.open_file_signal.emit(path))
-            action_extract=menu.addAction("Extraire vers..."); action_extract.triggered.connect(lambda: self._extract_file_to(path))
-        elif kind=="archive_file":
-            action_extract=menu.addAction("Extraire ce fichier..."); action_extract.triggered.connect(lambda: self._extract_archive_file(item))
-        menu.exec_(self.viewport().mapToGlobal(pos))
-    def _extract_file_to(self,file_path):
-        dest=QFileDialog.getSaveFileName(self,"Extraire sous",os.path.basename(file_path))[0]
-        if dest: shutil.copy2(file_path,dest)
-    def _extract_archive_file(self,item):
-        archive_path=item.parent().data(0,Qt.UserRole)[1]; internal=item.data(0,Qt.UserRole)[1]
-        dest=QFileDialog.getSaveFileName(self,"Extraire",os.path.basename(internal))[0]
-        if dest:
-            try: ArchiveManager.extract_file(archive_path,internal,dest)
-            except Exception as e: QMessageBox.critical(self,"Erreur",str(e))
-    def _set_icon(self,item,path):
-        ext=os.path.splitext(path)[1].lower()
-        if ext in ('.zip','.7z','.sarc','.zs','.tar','.gz','.bz2','.xz'):
-            item.setIcon(0,self.style().standardIcon(QStyle.SP_DriveHDIcon))
-        else: item.setIcon(0,self.style().standardIcon(QStyle.SP_FileIcon))
-    @staticmethod
-    def _format_size(size):
-        for unit in ['o','Ko','Mo','Go']:
-            if size<1024.0: return f"{size:.1f} {unit}"
-            size/=1024.0
-        return f"{size:.1f} To"
+            with zipfile.ZipFile(arc_path) as z:
+                z.extractall(tmp)
+            dst = os.path.join(tmp, internal)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            with open(dst, 'wb') as f:
+                f.write(new_data)
+            base = arc_path[:-4]
+            if os.path.exists(arc_path):
+                os.remove(arc_path)
+            shutil.make_archive(base, 'zip', tmp)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    elif ext == '.sarc':
+        arc = SarcReader(read_file(arc_path))
+        w = SarcWriter()
+        for n in arc.list_files():
+            w.add_file(n, new_data if n == internal else arc.get_file(n))
+        with open(arc_path, 'wb') as f:
+            f.write(w.save())
+    elif ext == '.zs':
+        dec = decompress_zs(read_file(arc_path))
+        if dec[:4] == b'SARC':
+            arc = SarcReader(dec)
+            w = SarcWriter()
+            for n in arc.list_files():
+                w.add_file(n, new_data if n == internal else arc.get_file(n))
+            with open(arc_path, 'wb') as f:
+                f.write(compress_zs(w.save()))
+        else:
+            with open(arc_path, 'wb') as f:
+                f.write(compress_zs(new_data))
 
-# --------------------------------------------------------------------
+# ─── Détection de type et vue hex ──────────────────────────
+def is_text(data: bytes) -> bool:
+    if not data:
+        return False
+    sample = data[:4096]
+    if b'\x00' in sample:
+        return False
+    ctrl = sum(1 for b in sample if b < 0x20 and b not in (9, 10, 13))
+    return (ctrl / len(sample)) <= 0.05
+
+def build_hex_view(data: bytes, max_bytes=65536) -> str:
+    lines = []
+    hdr = f"{'OFFSET':>10}  {'00 01 02 03 04 05 06 07  08 09 0A 0B 0C 0D 0E 0F':49}  ASCII"
+    lines.append(hdr)
+    lines.append('─' * len(hdr))
+    shown = data[:max_bytes]
+    for i in range(0, len(shown), 16):
+        chunk = shown[i:i+16]
+        left = ' '.join(f'{b:02X}' for b in chunk[:8])
+        right = ' '.join(f'{b:02X}' for b in chunk[8:])
+        asc = ''.join(chr(b) if 32 <= b < 127 else '.' for b in chunk)
+        lines.append(f'0x{i:08X}  {left:<23}  {right:<23}  {asc}')
+    if len(data) > max_bytes:
+        lines.append(f'... ({len(data):,} octets total)')
+    return '\n'.join(lines)
+
+def decode_file(raw: bytes, hint_ext: str = '') -> Tuple[str, str, bytes, bool, Optional[MsbtParser]]:
+    is_z = False
+    if raw[:4] == b'\x28\xB5\x2F\xFD':
+        try:
+            raw = decompress_zs(raw)
+            is_z = True
+        except:
+            pass
+
+    ext = hint_ext.lower()
+
+    # MSBT
+    if ext == '.msbt' or raw[:8] == b'MsgStdBn':
+        try:
+            msbt = MsbtParser(raw)
+            return 'msbt', msbt.to_txt(), raw, is_z, msbt
+        except:
+            pass
+
+    # Texte
+    if is_text(raw):
+        try:
+            return 'text', raw.decode('utf-8'), raw, is_z, None
+        except:
+            pass
+        try:
+            return 'text', raw.decode('utf-16'), raw, is_z, None
+        except:
+            pass
+
+    # Hex
+    return 'hex', build_hex_view(raw), raw, is_z, None
+
+# ─── Coloration syntaxique ─────────────────────────────────
+class HexHighlighter(QSyntaxHighlighter):
+    def highlightBlock(self, text):
+        fmt_off = QTextCharFormat()
+        fmt_off.setForeground(QColor('#569CD6'))
+        fmt_hex = QTextCharFormat()
+        fmt_hex.setForeground(QColor('#CE9178'))
+        fmt_asc = QTextCharFormat()
+        fmt_asc.setForeground(QColor('#4EC9B0'))
+
+        if text.startswith('0x'):
+            self.setFormat(0, 10, fmt_off)
+            self.setFormat(12, 49, fmt_hex)
+            if len(text) > 63:
+                self.setFormat(63, len(text) - 63, fmt_asc)
+
+class MsbtHighlighter(QSyntaxHighlighter):
+    def highlightBlock(self, text):
+        fmt_lbl = QTextCharFormat()
+        fmt_lbl.setForeground(QColor('#DCDCAA'))
+        fmt_lbl.setFontWeight(QFont.Bold)
+        fmt_sep = QTextCharFormat()
+        fmt_sep.setForeground(QColor('#555555'))
+        fmt_tag = QTextCharFormat()
+        fmt_tag.setForeground(QColor('#C586C0'))
+
+        if text.startswith('[') and text.endswith(']'):
+            self.setFormat(0, len(text), fmt_lbl)
+        elif text == '---':
+            self.setFormat(0, len(text), fmt_sep)
+        else:
+            for m in re.finditer(r'</?tag[^>]*>', text):
+                self.setFormat(m.start(), m.end() - m.start(), fmt_tag)
+
+# ─── Dialogue recherche/remplacement ───────────────────────
+class FindReplaceDialog(QDialog):
+    def __init__(self, editor, parent=None):
+        super().__init__(parent)
+        self.editor = editor
+        self._matches = []
+        self._cur = -1
+        self.setWindowTitle("Recherche & Remplacement")
+        self.setMinimumWidth(520)
+        self._build()
+
+    def _build(self):
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("Rechercher :"))
+        self.e_find = QLineEdit()
+        self.e_find.textChanged.connect(self._refresh)
+        lay.addWidget(self.e_find)
+
+        lay.addWidget(QLabel("Remplacer par :"))
+        self.e_repl = QLineEdit()
+        lay.addWidget(self.e_repl)
+
+        r3 = QHBoxLayout()
+        self.chk_case = QCheckBox("Casse exacte")
+        self.chk_word = QCheckBox("Mot entier")
+        self.chk_regex = QCheckBox("Regex")
+        self.lbl_count = QLabel("0 résultat(s)")
+        self.lbl_count.setStyleSheet("color:#569CD6;")
+        for w in (self.chk_case, self.chk_word, self.chk_regex):
+            w.stateChanged.connect(self._refresh)
+            r3.addWidget(w)
+        r3.addStretch()
+        r3.addWidget(self.lbl_count)
+        lay.addLayout(r3)
+
+        r4 = QHBoxLayout()
+        for label, slot in [
+            ("◀", self._prev), ("▶", self._next),
+            ("Remplacer", self._replace_one),
+            ("Tout remplacer", self._replace_all),
+            ("Fermer", self.close),
+        ]:
+            b = QPushButton(label)
+            b.clicked.connect(slot)
+            r4.addWidget(b)
+        lay.addLayout(r4)
+
+    def _pattern(self):
+        pat = self.e_find.text()
+        if not pat:
+            return None
+        if not self.chk_regex.isChecked():
+            pat = re.escape(pat)
+        if self.chk_word.isChecked():
+            pat = r'\b' + pat + r'\b'
+        flags = 0 if self.chk_case.isChecked() else re.IGNORECASE
+        try:
+            return re.compile(pat, flags)
+        except:
+            return None
+
+    def _refresh(self):
+        cur = self.editor.textCursor()
+        cur.select(QTextCursor.Document)
+        cur.setCharFormat(QTextCharFormat())
+        self.editor.setTextCursor(cur)
+
+        self._matches = []
+        rx = self._pattern()
+        if not rx:
+            self.lbl_count.setText("0 résultat(s)")
+            return
+        text = self.editor.toPlainText()
+        fmt = QTextCharFormat()
+        fmt.setBackground(QColor('#613214'))
+        fmt.setForeground(QColor('#ffffff'))
+        for m in rx.finditer(text):
+            self._matches.append((m.start(), m.end()))
+            c = self.editor.textCursor()
+            c.setPosition(m.start())
+            c.setPosition(m.end(), QTextCursor.KeepAnchor)
+            c.setCharFormat(fmt)
+        self.lbl_count.setText(f"{len(self._matches)} résultat(s)")
+        self._cur = -1
+
+    def _go(self, idx):
+        if not self._matches:
+            return
+        self._cur = idx % len(self._matches)
+        s, e = self._matches[self._cur]
+        fmt = QTextCharFormat()
+        fmt.setBackground(QColor('#D4A017'))
+        fmt.setForeground(QColor('#000000'))
+        c = self.editor.textCursor()
+        c.setPosition(s)
+        c.setPosition(e, QTextCursor.KeepAnchor)
+        c.setCharFormat(fmt)
+        self.editor.setTextCursor(c)
+        self.editor.ensureCursorVisible()
+
+    def _next(self):
+        self._refresh()
+        self._go(self._cur + 1)
+
+    def _prev(self):
+        self._refresh()
+        self._go(self._cur - 1)
+
+    def _replace_one(self):
+        c = self.editor.textCursor()
+        if c.hasSelection():
+            c.insertText(self.e_repl.text())
+        self._next()
+
+    def _replace_all(self):
+        rx = self._pattern()
+        if not rx:
+            return
+        txt = rx.sub(self.e_repl.text(), self.editor.toPlainText())
+        self.editor.setPlainText(txt)
+        self._refresh()
+
+# ─── Dialogue de comparaison ────────────────────────────────
+class CompareDialog(QDialog):
+    def __init__(self, left_path: str, right_path: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Comparaison de MSBT")
+        self.resize(1200, 700)
+        layout = QVBoxLayout(self)
+
+        self.left_edit = QTextEdit()
+        self.right_edit = QTextEdit()
+        self.left_edit.setReadOnly(True)
+        self.right_edit.setReadOnly(True)
+        self.left_edit.setFont(QFont("Consolas", 10))
+        self.right_edit.setFont(QFont("Consolas", 10))
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.addWidget(self.left_edit)
+        splitter.addWidget(self.right_edit)
+        layout.addWidget(splitter)
+
+        try:
+            raw_left = read_file(left_path)
+            raw_right = read_file(right_path)
+            msbt_left = MsbtParser(raw_left)
+            msbt_right = MsbtParser(raw_right)
+            left_txt = msbt_left.to_txt()
+            right_txt = msbt_right.to_txt()
+            self.left_edit.setPlainText(left_txt)
+            self.right_edit.setPlainText(right_txt)
+            self._highlight_diffs(left_txt, right_txt)
+        except Exception as e:
+            QMessageBox.critical(self, "Erreur", str(e))
+
+    def _highlight_diffs(self, left_text: str, right_text: str):
+        differ = difflib.Differ()
+        diff = list(differ.compare(left_text.splitlines(), right_text.splitlines()))
+        left_html = []
+        right_html = []
+        for line in diff:
+            if line.startswith('  '):
+                left_html.append(line[2:])
+                right_html.append(line[2:])
+            elif line.startswith('- '):
+                left_html.append(f'<span style="background:#ffcccc">{line[2:]}</span>')
+                right_html.append('')
+            elif line.startswith('+ '):
+                left_html.append('')
+                right_html.append(f'<span style="background:#ccffcc">{line[2:]}</span>')
+        self.left_edit.setHtml('<br>'.join(left_html))
+        self.right_edit.setHtml('<br>'.join(right_html))
+
+# ─── Onglet éditeur amélioré ───────────────────────────────
 class EditorTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.layout=QVBoxLayout(self); self.layout.setContentsMargins(0,0,0,0)
-        self.info_label=QLabel("Fermé"); self.info_label.setStyleSheet("background:#2a2a2a; color:#aaa; padding:2px;")
-        self.layout.addWidget(self.info_label)
-        self.editor=QPlainTextEdit(); self.editor.setReadOnly(True); self.editor.setFont(QFont("Consolas",10))
-        self.layout.addWidget(self.editor)
-        # barre recherche
-        search_layout=QHBoxLayout()
-        self.search_input=QLineEdit(); self.search_input.setPlaceholderText("Rechercher…"); self.search_input.setVisible(False)
-        self.btn_search_next=QPushButton("↓"); self.btn_search_prev=QPushButton("↑"); self.btn_search_close=QPushButton("✕")
-        self.search_input.returnPressed.connect(self.search_next)
-        self.btn_search_next.clicked.connect(self.search_next); self.btn_search_prev.clicked.connect(self.search_prev)
-        self.btn_search_close.clicked.connect(self.hide_search)
-        search_layout.addWidget(self.search_input); search_layout.addWidget(self.btn_search_next)
-        search_layout.addWidget(self.btn_search_prev); search_layout.addWidget(self.btn_search_close)
-        self.layout.addLayout(search_layout)
-        # barre outils
-        tool_layout=QHBoxLayout()
-        self.btn_toggle_edit=QPushButton("✏️ Éditer"); self.btn_toggle_edit.clicked.connect(self.toggle_edit)
-        self.btn_hex_mode=QPushButton("🔢 Hex"); self.btn_hex_mode.clicked.connect(self.toggle_hex_mode)
-        self.btn_save=QPushButton("💾 Sauver"); self.btn_save.clicked.connect(self.save_to_file_dialog)
-        self.btn_reload=QPushButton("↺ Recharger"); self.btn_reload.clicked.connect(lambda: self.load_file(self.current_file) if self.current_file else None)
-        tool_layout.addWidget(self.btn_toggle_edit); tool_layout.addWidget(self.btn_hex_mode)
-        tool_layout.addWidget(self.btn_save); tool_layout.addWidget(self.btn_reload)
-        self.layout.addLayout(tool_layout)
-        self.current_file=None; self.mode='text'; self.original_data=None; self.is_compressed=False; self.hex_data=None
+        self.arc_path = None
+        self.arc_int = None
+        self.file_path = None
+        self.raw = b''
+        self.mode = 'hex'
+        self.is_zstd = False
+        self.msbt = None
+        self.highlighter = None
+        self._editing = False
+        self._original_text = ""
 
-    def load_file(self, filepath):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0,0,0,0)
+
+        self.lbl_info = QLabel("—")
+        self.lbl_info.setStyleSheet("background:#252526; color:#888; padding:2px 8px; font-size:11px;")
+        layout.addWidget(self.lbl_info)
+
+        self.editor = QTextEdit()
+        self.editor.setReadOnly(True)
+        self.editor.setFont(QFont("Consolas", 10))
+        layout.addWidget(self.editor)
+
+        bar = QHBoxLayout()
+        bar.setContentsMargins(4,3,4,3)
+        self.btn_edit = QPushButton("✏️ Éditer")
+        self.btn_edit.clicked.connect(self._toggle_edit)
+        self.btn_hex = QPushButton("🔢 Hex")
+        self.btn_hex.clicked.connect(self._toggle_hex)
+        self.btn_save = QPushButton("💾 Sauver")
+        self.btn_save.clicked.connect(self._save)
+        self.btn_save.setEnabled(False)
+        self.btn_saveas = QPushButton("📤 Sous…")
+        self.btn_saveas.clicked.connect(self._save_as)
+        self.btn_find = QPushButton("🔍 Rechercher…")
+        self.btn_find.clicked.connect(lambda: FindReplaceDialog(self.editor, self).show())
+        for w in (self.btn_edit, self.btn_hex, self.btn_save, self.btn_saveas, self.btn_find):
+            bar.addWidget(w)
+        btn_w = QWidget()
+        btn_w.setLayout(bar)
+        btn_w.setStyleSheet("background:#252526; border-top:1px solid #333;")
+        layout.addWidget(btn_w)
+
+        self._image_widget = None
+
+    def load_direct(self, path: str):
+        self.file_path = path
+        self.arc_path = None
+        self.arc_int = None
         try:
-            with open(filepath,'rb') as f: raw=f.read()
-            if raw[:4]==b'\x28\xB5\x2F\xFD':
-                try: raw=zstd.ZstdDecompressor().decompress(raw); self.is_compressed=True
-                except: pass
-            self.current_file=filepath; self.original_data=raw; self.hex_data=raw
-            if raw[:8]==b'MsgStdBn':
-                try:
-                    parser=MsbtParser(raw); self.editor.setPlainText(parser.to_text())
-                    self.mode='msbt'; self.info_label.setText(f"📝 MSBT – {os.path.basename(filepath)}")
-                    return
-                except: pass
-            if is_probably_text(raw):
-                try:
-                    text=raw.decode('utf-8'); self.editor.setPlainText(text)
-                    self.mode='text'; self.info_label.setText(f"📄 Texte – {os.path.basename(filepath)}")
-                    return
-                except: pass
-                try:
-                    text=raw.decode('utf-16'); self.editor.setPlainText(text)
-                    self.mode='text'; self.info_label.setText(f"📄 Texte UTF-16 – {os.path.basename(filepath)}")
-                    return
-                except: pass
-            # hex
-            self._display_hex(raw); self.mode='hex'; self.info_label.setText(f"🔢 Binaire – {os.path.basename(filepath)}")
-        except Exception as e: self.editor.setPlainText(f"Erreur : {e}")
+            raw = read_file(path)
+        except Exception as e:
+            self.editor.setPlainText(f"Erreur lecture : {e}")
+            return
+        self._display(raw, Path(path).suffix)
 
-    def _display_hex(self,data):
-        lines=[]; lines.append(f"{'Offset':>10}  {'Hex (16 octets)':48}  {'ASCII':16}"); lines.append("-"*80)
-        for i in range(0,len(data),16):
-            chunk=data[i:i+16]; hex_part=' '.join(f'{b:02X}' for b in chunk)
-            ascii_part=''.join(chr(b) if 32<=b<127 else '.' for b in chunk)
-            lines.append(f"0x{i:08X}  {hex_part:<48}  {ascii_part}")
-        self.editor.setPlainText('\n'.join(lines))
+    def load_from_archive(self, arc_path: str, internal: str):
+        self.arc_path = arc_path
+        self.arc_int = internal
+        self.file_path = None
+        try:
+            raw = archive_extract(arc_path, internal)
+        except Exception as e:
+            self.editor.setPlainText(f"Erreur extraction : {e}")
+            return
+        self._display(raw, Path(internal).suffix)
 
-    def _hex_to_bytes(self,hex_text):
-        data=bytearray()
-        for line in hex_text.splitlines():
-            line=line.strip()
-            if not line or line.startswith("Offset") or line.startswith("-"): continue
-            parts=line.split()
-            if len(parts)<2: continue
-            hex_part=parts[1:17]
+    def _display(self, raw: bytes, ext: str = ''):
+        # Nettoyer l'image précédente
+        if self._image_widget:
+            self.layout().replaceWidget(self._image_widget, self.editor)
+            self._image_widget.deleteLater()
+            self._image_widget = None
+            self.editor.show()
+
+        # Prévisualisation image
+        if ext.lower() in ('.png', '.jpg', '.jpeg', '.dds'):
             try:
-                for h in hex_part:
-                    if len(h)==2: data.append(int(h,16))
-                    else: break
-            except: pass
-        return bytes(data)
+                pix = QPixmap()
+                if ext.lower() == '.dds':
+                    try:
+                        from PIL import Image
+                        img = Image.open(BytesIO(raw))
+                        img = img.convert("RGBA")
+                        qimg = QImage(img.tobytes("raw","RGBA"), img.width, img.height, QImage.Format_RGBA8888)
+                        pix = QPixmap.fromImage(qimg)
+                    except ImportError:
+                        pix.loadFromData(raw)
+                else:
+                    pix.loadFromData(raw)
+                if not pix.isNull():
+                    scroll = QScrollArea()
+                    lbl = QLabel()
+                    lbl.setPixmap(pix)
+                    scroll.setWidget(lbl)
+                    self.layout().replaceWidget(self.editor, scroll)
+                    self.editor.hide()
+                    self._image_widget = scroll
+                    self.mode = 'image'
+                    self.lbl_info.setText(f"  🖼 {os.path.basename(self.file_path or self.arc_int or '?')}  │  Image")
+                    return
+            except:
+                pass
 
-    def toggle_hex_mode(self):
-        if self.mode in ('hex','hex_edit'):
-            if self.mode=='hex_edit': self.hex_data=self._hex_to_bytes(self.editor.toPlainText())
-            self.load_file(self.current_file); self.btn_hex_mode.setText("🔢 Hex")
+        mode, txt, raw_dec, is_z, msbt = decode_file(raw, ext)
+        self.raw = raw_dec
+        self.mode = mode
+        self.is_zstd = is_z
+        self.msbt = msbt
+        self._editing = False
+        self.editor.setReadOnly(True)
+        self.btn_edit.setText("✏️ Éditer")
+        self.btn_save.setEnabled(False)
+
+        if self.highlighter:
+            self.highlighter.setDocument(None)
+        if mode == 'hex':
+            self.highlighter = HexHighlighter(self.editor.document())
+        elif mode == 'msbt':
+            self.highlighter = MsbtHighlighter(self.editor.document())
         else:
-            self._display_hex(self.original_data); self.mode='hex_edit'
-            self.editor.setReadOnly(False); self.btn_hex_mode.setText("📝 Normal")
-            self.info_label.setText(f"🔢 Édition Hex – {os.path.basename(self.current_file)}")
+            self.highlighter = None
 
-    def toggle_edit(self):
-        if self.mode in ('text','msbt'):
-            self.editor.setReadOnly(not self.editor.isReadOnly())
-            self.btn_toggle_edit.setText("🔒 Verrouiller" if not self.editor.isReadOnly() else "✏️ Éditer")
+        self.editor.setPlainText(txt)
+        self._original_text = txt
 
-    def get_edited_data(self):
-        if self.mode=='hex_edit': return self._hex_to_bytes(self.editor.toPlainText())
-        text=self.editor.toPlainText()
-        if self.mode=='msbt':
-            parser=MsbtParser(self.original_data); parser.update_from_text(text)
-            new_data=parser.save()
-            if self.is_compressed: new_data=compress_zs(new_data)
-            return new_data
-        elif self.mode=='text': return text.encode('utf-8')
-        else: return self.original_data
+        name = self.arc_int or (os.path.basename(self.file_path) if self.file_path else '?')
+        modes = {'msbt': 'MSBT', 'text': 'Texte', 'hex': 'Binaire/Hex', 'image': 'Image'}
+        zinfo = ' 🗜 zstd' if is_z else ''
+        self.lbl_info.setText(f"  {name}  │  {modes.get(mode, mode)}  │  {len(raw_dec):,} o{zinfo}")
 
-    def save_to_file_dialog(self):
-        if not self.current_file: return
-        path=QFileDialog.getSaveFileName(self,"Enregistrer sous",self.current_file)[0]
-        if path:
+    def _toggle_edit(self):
+        if self.mode == 'hex':
+            return
+        self._editing = not self._editing
+        self.editor.setReadOnly(not self._editing)
+        self.btn_edit.setText("🔒 Lecture seule" if self._editing else "✏️ Éditer")
+        self.btn_save.setEnabled(self._editing)
+
+    def _toggle_hex(self):
+        if self.mode != 'hex':
+            if self.highlighter:
+                self.highlighter.setDocument(None)
+            self.highlighter = HexHighlighter(self.editor.document())
+            self.editor.setPlainText(build_hex_view(self.raw))
+            self.btn_hex.setText("📝 Normal")
+            self._prev_mode = self.mode
+            self.mode = 'hex'
+        else:
+            self.mode = getattr(self, '_prev_mode', 'text')
+            self._display(self.raw, Path(self.arc_int or self.file_path or '').suffix)
+            self.btn_hex.setText("🔢 Hex")
+
+    def _build_output(self) -> bytes:
+        txt = self.editor.toPlainText()
+        if self.mode == 'msbt' and self.msbt:
+            self.msbt.from_txt(txt)
+            data = self.msbt.save()
+        elif self.mode == 'text':
+            data = txt.encode('utf-8')
+        else:
+            data = self.raw
+        if self.is_zstd:
+            data = compress_zs(data)
+        return data
+
+    def _save(self):
+        try:
+            data = self._build_output()
+            if self.arc_path and self.arc_int:
+                archive_update(self.arc_path, self.arc_int, data)
+                self._show_status("✅ Sauvegardé dans l'archive")
+                self._original_text = self.editor.toPlainText()
+            elif self.file_path:
+                with open(self.file_path, 'wb') as f:
+                    f.write(data)
+                self._show_status("✅ Fichier sauvegardé")
+                self._original_text = self.editor.toPlainText()
+        except Exception as e:
+            QMessageBox.critical(self, "Erreur sauvegarde", str(e))
+
+    def _save_as(self):
+        name = os.path.basename(self.arc_int or self.file_path or 'fichier')
+        dest, _ = QFileDialog.getSaveFileName(self, "Enregistrer sous…", name)
+        if not dest:
+            return
+        try:
+            with open(dest, 'wb') as f:
+                f.write(self._build_output())
+            self._show_status(f"✅ Enregistré : {dest}")
+        except Exception as e:
+            QMessageBox.critical(self, "Erreur", str(e))
+
+    def is_modified(self) -> bool:
+        if self.mode in ('msbt', 'text'):
+            return self.editor.toPlainText() != self._original_text
+        return False
+
+    def prompt_save(self) -> int:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Modifications non sauvegardées")
+        box.setText(f"Voulez-vous enregistrer les modifications de '{self.tab_name()}' ?")
+        box.setStandardButtons(QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel)
+        return box.exec_()
+
+    def tab_name(self) -> str:
+        return os.path.basename(self.arc_int or self.file_path or "sans nom")
+
+    def _show_status(self, msg):
+        win = self.window()
+        if hasattr(win, 'statusBar'):
+            win.statusBar().showMessage(msg)
+
+# ─── Arbre de fichiers avec arborescence d'archives ────────
+class FileTree(QTreeWidget):
+    open_file = pyqtSignal(str)
+    open_intern = pyqtSignal(str, str)
+
+    ARCHIVE_EXT = {'.zip', '.7z', '.tar', '.gz', '.bz2', '.xz', '.sarc', '.zs'}
+    EXT_ICON = {
+        '.sarc': '📦', '.zs': '🗜', '.msbt': '📝',
+        '.zip': '📦', '.7z': '📦', '.tar': '📦',
+        '.txt': '📄', '.yaml': '📋', '.json': '📋', '.xml': '📋',
+        '.png': '🖼', '.dds': '🖼', '.jpg': '🖼'
+    }
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setHeaderLabels(["Nom", "Taille"])
+        self.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._ctx_menu)
+        self.itemDoubleClicked.connect(self._on_dclick)
+        self.itemExpanded.connect(self._on_expand)
+        self.root_path = ''
+
+    def set_root(self, path: str):
+        self.clear()
+        self.root_path = path
+        self._populate(self.invisibleRootItem(), path)
+
+    def load_single_archive(self, path: str):
+        self.clear()
+        self.root_path = os.path.dirname(path)
+        self._add_file_item(self.invisibleRootItem(), os.path.basename(path), path)
+
+    def _populate(self, parent: QTreeWidgetItem, path: str):
+        try:
+            entries = sorted(os.listdir(path), key=lambda x: (not os.path.isdir(os.path.join(path, x)), x.lower()))
+        except PermissionError:
+            return
+        for name in entries:
+            full = os.path.join(path, name)
+            if os.path.isdir(full):
+                item = QTreeWidgetItem(parent, [f"📁 {name}", ""])
+                item.setData(0, Qt.UserRole, ('dir', full))
+                item.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
+                QTreeWidgetItem(item, ["…"])
+            else:
+                self._add_file_item(parent, name, full)
+
+    def _add_file_item(self, parent: QTreeWidgetItem, name: str, full: str):
+        ext = Path(name).suffix.lower()
+        icon = self.EXT_ICON.get(ext, '📄')
+        size = os.path.getsize(full) if os.path.exists(full) else 0
+        item = QTreeWidgetItem(parent, [f"{icon} {name}", self._fmt_size(size)])
+        item.setData(0, Qt.UserRole, ('file', full))
+        if ext in self.ARCHIVE_EXT:
+            item.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
+            QTreeWidgetItem(item, ["…"])
+
+    def _on_expand(self, item: QTreeWidgetItem):
+        if item.childCount() == 1 and item.child(0).text(0) == "…":
+            item.takeChildren()
+            kind, path = item.data(0, Qt.UserRole)
+            if kind == 'dir':
+                self._populate(item, path)
+            elif kind == 'file':
+                self._load_archive_children(item, path)
+
+    def _load_archive_children(self, parent: QTreeWidgetItem, arc_path: str):
+        """Construit l'arborescence complète de l'archive."""
+        try:
+            files = archive_list(arc_path)
+            tree = {}
+            for f in files:
+                parts = Path(f).parts
+                current = tree
+                for i, part in enumerate(parts):
+                    if part not in current:
+                        is_file = (i == len(parts) - 1)
+                        current[part] = {'__file__': f if is_file else None, '__children__': {}}
+                    if is_file:
+                        current[part]['__file__'] = f
+                    current = current[part]['__children__']
+
+            def fill(parent_item, d):
+                for name, info in sorted(d.items()):
+                    children = info['__children__']
+                    fname = info['__file__']
+                    if fname is not None:  # fichier
+                        ext = Path(name).suffix.lower()
+                        icon = self.EXT_ICON.get(ext, '📄')
+                        child = QTreeWidgetItem(parent_item, [f"{icon} {name}", ""])
+                        child.setData(0, Qt.UserRole, ('archive_file', arc_path, fname))
+                        child.setToolTip(0, fname)
+                    else:  # dossier
+                        folder_item = QTreeWidgetItem(parent_item, [f"📁 {name}", ""])
+                        folder_item.setData(0, Qt.UserRole, ('archive_folder', arc_path, None))
+                        folder_item.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
+                        QTreeWidgetItem(folder_item, ["…"])  # placeholder
+                        fill(folder_item, children)
+            fill(parent, tree)
+
+        except Exception as e:
+            QTreeWidgetItem(parent, [f"⚠ {e}", ""])
+
+    def _on_expand_archive_folder(self, item: QTreeWidgetItem):
+        """Développe un sous-dossier d'archive."""
+        if item.childCount() == 1 and item.child(0).text(0) == "…":
+            item.takeChildren()
+            # Trouver l'archive parente
+            parent = item.parent()
+            while parent:
+                data = parent.data(0, Qt.UserRole)
+                if data and data[0] == 'file':
+                    arc_path = data[1]
+                    # Reconstruire le chemin interne du dossier
+                    internal_dir = self._get_internal_dir(item)
+                    self._load_archive_subfolder(item, arc_path, internal_dir)
+                    break
+                parent = parent.parent()
+
+    def _get_internal_dir(self, item: QTreeWidgetItem) -> str:
+        parts = []
+        while item:
+            data = item.data(0, Qt.UserRole)
+            if data and data[0] == 'archive_folder':
+                parts.append(item.text(0).replace('📁 ', ''))
+            elif data and data[0] == 'file':
+                break
+            item = item.parent()
+        return '/'.join(reversed(parts)) + '/'
+
+    def _load_archive_subfolder(self, parent_item: QTreeWidgetItem, arc_path: str, internal_dir: str):
+        try:
+            files = archive_list(arc_path)
+            sub_files = [f for f in files if f.startswith(internal_dir)]
+            tree = {}
+            for f in sub_files:
+                rel = os.path.relpath(f, internal_dir)
+                parts = Path(rel).parts
+                current = tree
+                for i, part in enumerate(parts):
+                    if part not in current:
+                        is_file = (i == len(parts) - 1)
+                        current[part] = {'__file__': f if is_file else None, '__children__': {}}
+                    if is_file:
+                        current[part]['__file__'] = f
+                    current = current[part]['__children__']
+
+            def fill(parent_item, d):
+                for name, info in sorted(d.items()):
+                    children = info['__children__']
+                    fname = info['__file__']
+                    if fname is not None:
+                        ext = Path(name).suffix.lower()
+                        icon = self.EXT_ICON.get(ext, '📄')
+                        child = QTreeWidgetItem(parent_item, [f"{icon} {name}", ""])
+                        child.setData(0, Qt.UserRole, ('archive_file', arc_path, fname))
+                        child.setToolTip(0, fname)
+                    else:
+                        folder_item = QTreeWidgetItem(parent_item, [f"📁 {name}", ""])
+                        folder_item.setData(0, Qt.UserRole, ('archive_folder', arc_path, None))
+                        folder_item.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
+                        QTreeWidgetItem(folder_item, ["…"])
+                        fill(folder_item, children)
+            fill(parent_item, tree)
+
+        except Exception as e:
+            QTreeWidgetItem(parent_item, [f"⚠ {e}", ""])
+
+    # Surcharge de l'événement d'expansion pour intercepter les dossiers d'archive
+    def event(self, e):
+        if e.type() == e.ChildAdded:
+            item = self.itemAt(e.pos())
+            if item and item.data(0, Qt.UserRole) and item.data(0, Qt.UserRole)[0] == 'archive_folder':
+                item.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
+        return super().event(e)
+
+    # Connexion manuelle pour les dossiers d'archive
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.itemExpanded.connect(self._on_expand)
+        self.itemExpanded.connect(self._on_expand_archive_folder)
+
+    def _on_dclick(self, item, _col):
+        data = item.data(0, Qt.UserRole)
+        if not data:
+            return
+        if data[0] == 'file':
+            ext = Path(data[1]).suffix.lower()
+            if ext not in self.ARCHIVE_EXT:
+                self.open_file.emit(data[1])
+        elif data[0] == 'archive_file':
+            _, arc_path, internal = data
+            self.open_intern.emit(arc_path, internal)
+
+    def _ctx_menu(self, pos):
+        items = self.selectedItems()
+        if not items:
+            return
+        menu = QMenu(self)
+        item = items[0]
+        data = item.data(0, Qt.UserRole)
+        if not data:
+            return
+
+        if data[0] == 'file':
+            menu.addAction("Ouvrir").triggered.connect(lambda: self.open_file.emit(data[1]))
+            menu.addAction("Extraire vers…").triggered.connect(lambda: self._extract_direct(data[1]))
+            if Path(data[1]).suffix.lower() == '.msbt':
+                menu.addAction("Comparer avec…").triggered.connect(lambda: self._compare_file(data[1]))
+        elif data[0] == 'archive_file':
+            _, arc, internal = data
+            menu.addAction("Ouvrir").triggered.connect(lambda: self.open_intern.emit(arc, internal))
+            menu.addAction("Extraire vers…").triggered.connect(lambda: self._extract_internal(arc, internal))
+            if Path(internal).suffix.lower() == '.msbt':
+                menu.addAction("📤 Exporter TXT…").triggered.connect(lambda: self._export_msbt(arc, internal))
+                menu.addAction("Comparer avec…").triggered.connect(lambda: self._compare_archive_file(arc, internal))
+        if len(items) > 1:
+            msbt_items = [i for i in items if i.data(0, Qt.UserRole) and i.data(0, Qt.UserRole)[0] == 'archive_file' and Path(i.data(0, Qt.UserRole)[2]).suffix.lower() == '.msbt']
+            if msbt_items:
+                menu.addAction(f"📤 Exporter {len(msbt_items)} MSBT → TXT…").triggered.connect(lambda: self._batch_export_items(msbt_items))
+        menu.exec_(self.viewport().mapToGlobal(pos))
+
+    def _compare_file(self, path: str):
+        other, _ = QFileDialog.getOpenFileName(self, "Choisir un autre fichier MSBT", filter="*.msbt")
+        if other:
+            dlg = CompareDialog(path, other, self)
+            dlg.exec_()
+
+    def _compare_archive_file(self, arc_path: str, internal: str):
+        tmp = tempfile.mkdtemp()
+        tmp_file = os.path.join(tmp, os.path.basename(internal))
+        try:
+            data = archive_extract(arc_path, internal)
+            with open(tmp_file, 'wb') as f:
+                f.write(data)
+            self._compare_file(tmp_file)
+        except Exception as e:
+            QMessageBox.critical(self, "Erreur", str(e))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def _extract_direct(self, path):
+        dest, _ = QFileDialog.getSaveFileName(self, "Extraire sous…", os.path.basename(path))
+        if dest:
+            shutil.copy2(path, dest)
+
+    def _extract_internal(self, arc, internal):
+        dest, _ = QFileDialog.getSaveFileName(self, "Extraire sous…", os.path.basename(internal))
+        if dest:
             try:
-                with open(path,'wb') as f: f.write(self.get_edited_data())
-                QMessageBox.information(self,"Succès","Fichier sauvegardé")
-            except Exception as e: QMessageBox.critical(self,"Erreur",str(e))
+                data = archive_extract(arc, internal)
+                with open(dest, 'wb') as f:
+                    f.write(data)
+            except Exception as e:
+                QMessageBox.critical(self, "Erreur", str(e))
 
-    def show_search(self):
-        self.search_input.setVisible(True); self.btn_search_next.setVisible(True)
-        self.btn_search_prev.setVisible(True); self.btn_search_close.setVisible(True)
-        self.search_input.setFocus()
+    def _export_msbt(self, arc, internal):
+        try:
+            raw = archive_extract(arc, internal)
+            msbt = MsbtParser(raw)
+            dest, _ = QFileDialog.getSaveFileName(self, "Exporter TXT…", Path(internal).stem + '.txt', "*.txt")
+            if dest:
+                with open(dest, 'w', encoding='utf-8') as f:
+                    f.write(msbt.to_txt())
+        except Exception as e:
+            QMessageBox.critical(self, "Erreur", str(e))
 
-    def hide_search(self):
-        self.search_input.setVisible(False); self.btn_search_next.setVisible(False)
-        self.btn_search_prev.setVisible(False); self.btn_search_close.setVisible(False)
+    def _batch_export_items(self, items):
+        dest_dir = QFileDialog.getExistingDirectory(self, "Dossier destination")
+        if not dest_dir:
+            return
+        done = 0
+        for item in items:
+            _, arc, internal = item.data(0, Qt.UserRole)
+            try:
+                raw = archive_extract(arc, internal)
+                msbt = MsbtParser(raw)
+                out = os.path.join(dest_dir, Path(internal).stem + '.txt')
+                with open(out, 'w', encoding='utf-8') as f:
+                    f.write(msbt.to_txt())
+                done += 1
+            except:
+                pass
+        QMessageBox.information(self, "Export", f"{done} fichier(s) exporté(s).")
 
-    def search_next(self):
-        text=self.search_input.text()
-        if not text: return
-        cursor=self.editor.textCursor()
-        if cursor.hasSelection(): cursor.setPosition(cursor.selectionEnd())
-        found=self.editor.document().find(text,cursor)
-        if not found:
-            cursor.setPosition(0); found=self.editor.document().find(text,cursor)
-        if found: self.editor.setTextCursor(found)
+    @staticmethod
+    def _fmt_size(sz: int) -> str:
+        for u in ('o', 'Ko', 'Mo', 'Go'):
+            if sz < 1024:
+                return f"{sz:.0f} {u}"
+            sz /= 1024
+        return f"{sz:.1f} To"
 
-    def search_prev(self):
-        text=self.search_input.text()
-        if not text: return
-        cursor=self.editor.textCursor()
-        if cursor.hasSelection(): cursor.setPosition(cursor.selectionStart())
-        found=self.editor.document().find(text,cursor,Qt.TextDocument.FindBackward)
-        if not found:
-            cursor.movePosition(QTextCursor.End); found=self.editor.document().find(text,cursor,Qt.TextDocument.FindBackward)
-        if found: self.editor.setTextCursor(found)
+# ─── Style sombre ───────────────────────────────────────────
+STYLE = """
+QMainWindow, QWidget    { background:#1e1e1e; color:#d4d4d4; }
+QMenuBar                { background:#2d2d2d; color:#ccc; }
+QMenuBar::item:selected { background:#094771; }
+QMenu                   { background:#2d2d2d; color:#ccc; border:1px solid #555; }
+QMenu::item:selected    { background:#094771; }
+QToolBar                { background:#2d2d2d; border:none; padding:3px; spacing:4px; }
+QStatusBar              { background:#007ACC; color:#fff; font-size:11px; }
+QSplitter::handle       { background:#333; width:3px; }
 
-# --------------------------------------------------------------------
+QTreeWidget             { background:#252526; border:none; color:#d4d4d4; }
+QTreeWidget::item       { padding:2px 4px; }
+QTreeWidget::item:selected  { background:#094771; color:#fff; }
+QTreeWidget::item:hover     { background:#2a2d2e; }
+QHeaderView::section    { background:#2d2d2d; color:#888; border:none; border-right:1px solid #3a3a3a; padding:3px 6px; font-size:11px; }
+
+QTextEdit               { background:#1e1e1e; color:#d4d4d4; border:none; font-family:'Cascadia Code','Consolas',monospace; font-size:11px; selection-background-color:#264F78; }
+QLineEdit               { background:#3c3c3c; color:#d4d4d4; border:1px solid #555; padding:3px 6px; border-radius:3px; }
+QLineEdit:focus         { border-color:#007ACC; }
+QPushButton             { background:#3a3a3a; color:#d4d4d4; border:1px solid #555; padding:3px 10px; border-radius:3px; }
+QPushButton:hover       { background:#094771; border-color:#007ACC; }
+QPushButton:pressed     { background:#005a9e; }
+QPushButton:disabled    { color:#555; background:#2a2a2a; }
+
+QTabWidget::pane        { border:1px solid #333; }
+QTabBar::tab            { background:#2d2d2d; color:#888; padding:5px 14px; border:none; }
+QTabBar::tab:selected   { background:#1e1e1e; color:#d4d4d4; border-bottom:2px solid #007ACC; }
+QTabBar::tab:hover      { color:#ccc; }
+
+QComboBox               { background:#3c3c3c; color:#d4d4d4; border:1px solid #555; padding:2px 6px; border-radius:3px; }
+QComboBox QAbstractItemView { background:#2d2d2d; color:#d4d4d4; selection-background-color:#094771; }
+QScrollBar:vertical     { background:#252526; width:10px; border:none; }
+QScrollBar::handle:vertical { background:#424242; border-radius:5px; min-height:20px; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; }
+"""
+
+# ─── Fenêtre principale ─────────────────────────────────────
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("TOTK MOD EDITOR")
-        self.setGeometry(100,100,1400,800)
-        self._setup_ui()
-        self._apply_theme()
-        self.statusBar().showMessage("Prêt")
+        self.setGeometry(80, 80, 1400, 860)
+        self.setStyleSheet(STYLE)
+        self._build_toolbar()
+        self._build_central()
+        self.tabs.tabCloseRequested.connect(self._close_tab)
+        self.statusBar().showMessage("Prêt — Ctrl+O dossier, Ctrl+F fichier")
 
-    def _setup_ui(self):
-        toolbar=self.addToolBar("Outils")
-        toolbar.addWidget(QLabel("Jeu: "))
-        self.game_combo=QComboBox()
-        self.game_combo.addItems(GAMES.keys())
-        self.game_combo.currentTextChanged.connect(self._change_game)
-        toolbar.addWidget(self.game_combo)
-        toolbar.addSeparator()
-        toolbar.addWidget(QLabel("Racine: "))
-        self.root_edit=QLineEdit(); self.root_edit.setMaximumWidth(300); toolbar.addWidget(self.root_edit)
-        btn_browse=QPushButton("Parcourir"); btn_browse.clicked.connect(self.browse_root); toolbar.addWidget(btn_browse)
-        toolbar.addSeparator()
-        toolbar.addWidget(QLabel("Dictionnaire Zstd:"))
-        self.dict_path_edit=QLineEdit(); self.dict_path_edit.setMaximumWidth(250); self.dict_path_edit.setReadOnly(True)
-        toolbar.addWidget(self.dict_path_edit)
-        btn_load_dict=QPushButton("Charger .dict"); btn_load_dict.clicked.connect(self.load_dictionary); toolbar.addWidget(btn_load_dict)
-        toolbar.addSeparator()
-        self.btn_export_yaml=QPushButton("📤 Export YAML"); self.btn_export_yaml.clicked.connect(lambda: self.batch_export(True))
-        toolbar.addWidget(self.btn_export_yaml)
-        self.btn_import_yaml=QPushButton("📥 Import YAML"); self.btn_import_yaml.clicked.connect(lambda: self.batch_export(False))
-        toolbar.addWidget(self.btn_import_yaml)
-        # Splitter
-        splitter=QSplitter(Qt.Horizontal)
-        self.file_tree=FileTreeWidget(); self.file_tree.open_file_signal.connect(self.open_file_in_editor)
-        splitter.addWidget(self.file_tree)
-        self.tab_widget=QTabWidget(); self.tab_widget.setTabsClosable(True)
-        self.tab_widget.tabCloseRequested.connect(self.close_tab)
-        splitter.addWidget(self.tab_widget)
-        splitter.setSizes([400,1000])
-        central=QWidget(); layout=QVBoxLayout(central); layout.addWidget(splitter)
-        self.setCentralWidget(central)
+    def _build_toolbar(self):
+        tb = self.addToolBar("Principal")
+        tb.setMovable(False)
 
-    def _apply_theme(self):
-        dark=QPalette()
-        dark.setColor(QPalette.Window, QColor(30,30,30)); dark.setColor(QPalette.WindowText, Qt.white)
-        dark.setColor(QPalette.Base, QColor(37,37,37)); dark.setColor(QPalette.AlternateBase, QColor(40,40,40))
-        dark.setColor(QPalette.Text, Qt.white); dark.setColor(QPalette.Button, QColor(50,50,50))
-        dark.setColor(QPalette.ButtonText, Qt.white); dark.setColor(QPalette.Highlight, QColor(9,71,113))
-        dark.setColor(QPalette.HighlightedText, Qt.white)
-        self.setPalette(dark)
-        self.setStyleSheet("""
-            QTreeWidget { background:#252526; color:#d4d4d4; }
-            QPlainTextEdit, QTextEdit { background:#1e1e1e; color:#d4d4d4; }
-            QLineEdit { background:#3c3c3c; color:#d4d4d4; border:1px solid #555; }
-            QPushButton { background:#3a3a3a; color:#d4d4d4; border:1px solid #555; padding:4px; }
-            QPushButton:hover { background:#505050; }
-            QTabWidget::pane { border:1px solid #444; }
-            QTabBar::tab { background:#2d2d2d; color:#ccc; padding:5px 15px; }
-            QTabBar::tab:selected { background:#1e1e1e; }
-        """)
+        tb.addWidget(QLabel(" Jeu : "))
+        self.combo_game = QComboBox()
+        self.combo_game.addItems(list(GAMES.keys()))
+        self.combo_game.currentTextChanged.connect(self._change_game)
+        tb.addWidget(self.combo_game)
+        tb.addSeparator()
 
-    def _change_game(self, name):
-        global current_game_config
-        if name in GAMES: current_game_config=GAMES[name]; self.statusBar().showMessage(f"Jeu : {name}")
+        tb.addWidget(QLabel(" Dossier : "))
+        self.e_root = QLineEdit()
+        self.e_root.setMinimumWidth(260)
+        self.e_root.setReadOnly(True)
+        tb.addWidget(self.e_root)
+        btn_folder = QPushButton("📁 Dossier")
+        btn_folder.clicked.connect(self._open_folder)
+        tb.addWidget(btn_folder)
+        btn_file = QPushButton("📄 Fichier")
+        btn_file.clicked.connect(self._open_file)
+        tb.addWidget(btn_file)
+        tb.addSeparator()
 
-    def browse_root(self):
-        folder=QFileDialog.getExistingDirectory(self,"Dossier ROMFS")
-        if folder: self.root_edit.setText(folder); self.file_tree.set_root(folder)
+        tb.addWidget(QLabel(" Dict Zstd : "))
+        self.e_dict = QLineEdit()
+        self.e_dict.setMaximumWidth(180)
+        self.e_dict.setReadOnly(True)
+        self.e_dict.setPlaceholderText("(optionnel)")
+        tb.addWidget(self.e_dict)
+        btn_dict = QPushButton("Charger .dict")
+        btn_dict.clicked.connect(self._load_dict)
+        tb.addWidget(btn_dict)
+        tb.addSeparator()
 
-    def load_dictionary(self):
-        path,_=QFileDialog.getOpenFileName(self,"Fichier dictionnaire Zstd","","*.dict")
-        if path: set_zstd_dictionary(path); self.dict_path_edit.setText(path)
+        btn_exp_lot = QPushButton("📤 Export MSBT→TXT (lot)")
+        btn_exp_lot.clicked.connect(self._batch_export)
+        tb.addWidget(btn_exp_lot)
+        btn_imp_lot = QPushButton("📥 Import TXT→MSBT (lot)")
+        btn_imp_lot.clicked.connect(self._batch_import)
+        tb.addWidget(btn_imp_lot)
 
-    def open_file_in_editor(self, filepath):
-        for i in range(self.tab_widget.count()):
-            tab=self.tab_widget.widget(i)
-            if hasattr(tab,'current_file') and tab.current_file==filepath:
-                self.tab_widget.setCurrentIndex(i); return
-        tab=EditorTab(); tab.load_file(filepath)
-        self.tab_widget.addTab(tab, os.path.basename(filepath)); self.tab_widget.setCurrentWidget(tab)
+        # Menu Fichier
+        mb = self.menuBar()
+        mf = mb.addMenu("Fichier")
+        a_folder = QAction("Ouvrir dossier…", self)
+        a_folder.setShortcut("Ctrl+O")
+        a_folder.triggered.connect(self._open_folder)
+        mf.addAction(a_folder)
+        a_file = QAction("Ouvrir fichier…", self)
+        a_file.setShortcut("Ctrl+F")
+        a_file.triggered.connect(self._open_file)
+        mf.addAction(a_file)
+        mf.addSeparator()
+        a_quit = QAction("Quitter", self)
+        a_quit.setShortcut("Ctrl+Q")
+        a_quit.triggered.connect(self.close)
+        mf.addAction(a_quit)
 
-    def close_tab(self,index):
-        widget=self.tab_widget.widget(index); self.tab_widget.removeTab(index); widget.deleteLater()
+    def _build_central(self):
+        splitter = QSplitter(Qt.Horizontal)
+        self.setCentralWidget(splitter)
 
-    def batch_export(self, export=True):
-        root=self.root_edit.text()
-        if not root: QMessageBox.warning(self,"Erreur","Sélectionnez un dossier racine"); return
-        dest=QFileDialog.getExistingDirectory(self,"Dossier cible")
-        if not dest: return
-        progress=QProgressDialog("Traitement des fichiers MSBT...","Annuler",0,0,self)
-        progress.setWindowModality(Qt.WindowModal); progress.show()
-        count=0
-        for dirpath,_,files in os.walk(root):
-            if progress.wasCanceled(): break
-            for f in files:
-                if progress.wasCanceled(): break
-                if f.endswith('.msbt'):
-                    full=os.path.join(dirpath,f)
+        self.tree = FileTree()
+        self.tree.open_file.connect(self._open_tab_direct)
+        self.tree.open_intern.connect(self._open_tab_intern)
+        splitter.addWidget(self.tree)
+
+        self.tabs = QTabWidget()
+        self.tabs.setTabsClosable(True)
+        self.tabs.tabCloseRequested.connect(self._close_tab)
+        splitter.addWidget(self.tabs)
+
+        splitter.setSizes([320, 1080])
+
+    def _open_folder(self):
+        path = QFileDialog.getExistingDirectory(self, "Choisir le dossier ROMFS")
+        if path:
+            self.e_root.setText(path)
+            self.tree.set_root(path)
+            self.statusBar().showMessage(f"Dossier : {path}")
+
+    def _open_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Ouvrir un fichier",
+                                              filter="Tous fichiers (*);;SARC (*.sarc);;ZS (*.zs);;MSBT (*.msbt)")
+        if not path:
+            return
+        ext = Path(path).suffix.lower()
+        if ext in FileTree.ARCHIVE_EXT:
+            self.e_root.setText(os.path.dirname(path))
+            self.tree.load_single_archive(path)
+            self.statusBar().showMessage(f"Archive : {path}")
+        else:
+            self._open_tab_direct(path)
+
+    def _open_tab_direct(self, path: str):
+        for i in range(self.tabs.count()):
+            tab = self.tabs.widget(i)
+            if isinstance(tab, EditorTab) and tab.file_path == path:
+                self.tabs.setCurrentIndex(i)
+                return
+        tab = EditorTab()
+        tab.load_direct(path)
+        self.tabs.addTab(tab, os.path.basename(path))
+        self.tabs.setCurrentWidget(tab)
+
+    def _open_tab_intern(self, arc_path: str, internal: str):
+        for i in range(self.tabs.count()):
+            tab = self.tabs.widget(i)
+            if isinstance(tab, EditorTab) and tab.arc_path == arc_path and tab.arc_int == internal:
+                self.tabs.setCurrentIndex(i)
+                return
+        tab = EditorTab()
+        tab.load_from_archive(arc_path, internal)
+        self.tabs.addTab(tab, os.path.basename(internal))
+        self.tabs.setCurrentWidget(tab)
+
+    def _close_tab(self, idx: int):
+        tab = self.tabs.widget(idx)
+        if isinstance(tab, EditorTab) and tab.is_modified():
+            ret = tab.prompt_save()
+            if ret == QMessageBox.Save:
+                tab._save()
+            elif ret == QMessageBox.Cancel:
+                return
+        self.tabs.removeTab(idx)
+        tab.deleteLater()
+
+    def _change_game(self, name: str):
+        global current_game
+        if name in GAMES:
+            current_game = GAMES[name]
+            self.statusBar().showMessage(f"Config jeu : {GAMES[name].name}")
+
+    def _load_dict(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Dictionnaire Zstd", "", "*.dict *.zsdic")
+        if path:
+            try:
+                set_zstd_dict(path)
+                self.e_dict.setText(os.path.basename(path))
+                self.statusBar().showMessage(f"Dictionnaire chargé : {path}")
+            except Exception as e:
+                QMessageBox.critical(self, "Erreur dict", str(e))
+
+    def _batch_export(self):
+        root = self.e_root.text()
+        if not root or not os.path.isdir(root):
+            QMessageBox.warning(self, "Erreur", "Ouvrir d'abord un dossier.")
+            return
+        dest = QFileDialog.getExistingDirectory(self, "Dossier destination TXT")
+        if not dest:
+            return
+        prog = QProgressDialog("Export en cours…", "Annuler", 0, 0, self)
+        prog.setWindowModality(Qt.WindowModal)
+        prog.show()
+        done, errs = 0, []
+        for dirpath, _, files in os.walk(root):
+            if prog.wasCanceled():
+                break
+            for fname in files:
+                if prog.wasCanceled():
+                    break
+                fpath = os.path.join(dirpath, fname)
+                ext = Path(fname).suffix.lower()
+                prog.setLabelText(fname)
+                QApplication.processEvents()
+                if ext == '.msbt':
                     try:
-                        with open(full,'rb') as fh: data=fh.read()
-                        parser=MsbtParser(data)
-                        if export:
-                            yaml_str=parser.to_yaml()
-                            out_name=os.path.splitext(f)[0]+'.yaml'
-                            with open(os.path.join(dest,out_name),'w',encoding='utf-8') as out: out.write(yaml_str)
-                        else:
-                            yaml_name=os.path.splitext(f)[0]+'.yaml'
-                            yaml_path=os.path.join(dest,yaml_name)
-                            if os.path.exists(yaml_path):
-                                with open(yaml_path,'r',encoding='utf-8') as yf: parser.from_yaml(yf.read())
-                                with open(full,'wb') as fh: fh.write(parser.save())
-                        count+=1
-                    except Exception as e: print(f"Erreur {full}: {e}")
-        progress.close()
-        QMessageBox.information(self,"Terminé",f"{count} fichiers traités")
+                        raw = read_file(fpath)
+                        if raw[:4] == b'\x28\xB5\x2F\xFD':
+                            raw = decompress_zs(raw)
+                        msbt = MsbtParser(raw)
+                        rel = os.path.relpath(fpath, root)
+                        out = os.path.join(dest, rel + '.txt')
+                        os.makedirs(os.path.dirname(out), exist_ok=True)
+                        with open(out, 'w', encoding='utf-8') as f:
+                            f.write(msbt.to_txt())
+                        done += 1
+                    except Exception as e:
+                        errs.append(f"{fname}: {e}")
+                elif ext in ('.sarc', '.zs'):
+                    try:
+                        raw = read_file(fpath)
+                        if ext == '.zs':
+                            raw = decompress_zs(raw)
+                        if raw[:4] != b'SARC':
+                            continue
+                        sarc = SarcReader(raw)
+                        for iname in sarc.list_files():
+                            if Path(iname).suffix.lower() != '.msbt':
+                                continue
+                            try:
+                                msbt = MsbtParser(sarc.get_file(iname))
+                                rel = os.path.relpath(fpath, root)
+                                out = os.path.join(dest, rel, iname + '.txt')
+                                os.makedirs(os.path.dirname(out), exist_ok=True)
+                                with open(out, 'w', encoding='utf-8') as f:
+                                    f.write(msbt.to_txt())
+                                done += 1
+                            except Exception as e:
+                                errs.append(f"{iname}: {e}")
+                    except Exception as e:
+                        errs.append(f"{fname}: {e}")
+        prog.close()
+        msg = f"Export terminé : {done} fichier(s)."
+        if errs:
+            msg += f"\n\nErreurs :\n" + '\n'.join(errs[:15])
+        QMessageBox.information(self, "Export par lot", msg)
 
-if __name__=="__main__":
-    app=QApplication(sys.argv); app.setStyle("Fusion")
-    win=MainWindow(); win.show()
+    def _batch_import(self):
+        root = self.e_root.text()
+        if not root or not os.path.isdir(root):
+            QMessageBox.warning(self, "Erreur", "Ouvrir d'abord un dossier.")
+            return
+        src = QFileDialog.getExistingDirectory(self, "Dossier source TXT")
+        if not src:
+            return
+        prog = QProgressDialog("Import en cours…", "Annuler", 0, 0, self)
+        prog.setWindowModality(Qt.WindowModal)
+        prog.show()
+        done, errs = 0, []
+        for dirpath, _, files in os.walk(src):
+            if prog.wasCanceled():
+                break
+            for fname in files:
+                if prog.wasCanceled():
+                    break
+                if not fname.endswith('.txt'):
+                    continue
+                txt_path = os.path.join(dirpath, fname)
+                rel_txt = os.path.relpath(txt_path, src)
+                rel_orig = rel_txt[:-4] if rel_txt.endswith('.txt') else rel_txt
+                orig = os.path.join(root, rel_orig)
+                prog.setLabelText(fname)
+                QApplication.processEvents()
+                if os.path.isfile(orig) and orig.lower().endswith('.msbt'):
+                    try:
+                        raw = read_file(orig)
+                        is_z = raw[:4] == b'\x28\xB5\x2F\xFD'
+                        if is_z:
+                            raw = decompress_zs(raw)
+                        msbt = MsbtParser(raw)
+                        with open(txt_path, 'r', encoding='utf-8') as f:
+                            msbt.from_txt(f.read())
+                        out = msbt.save()
+                        if is_z:
+                            out = compress_zs(out)
+                        with open(orig, 'wb') as f:
+                            f.write(out)
+                        done += 1
+                    except Exception as e:
+                        errs.append(f"{rel_orig}: {e}")
+                else:
+                    parts = Path(rel_orig).parts
+                    for i in range(len(parts) - 1, 0, -1):
+                        arc_rel = os.path.join(*parts[:i])
+                        int_name = '/'.join(parts[i:])
+                        arc_path = os.path.join(root, arc_rel)
+                        if os.path.isfile(arc_path) and Path(arc_path).suffix.lower() in ('.sarc', '.zs'):
+                            try:
+                                iraw = archive_extract(arc_path, int_name)
+                                msbt = MsbtParser(iraw)
+                                with open(txt_path, 'r', encoding='utf-8') as f:
+                                    msbt.from_txt(f.read())
+                                archive_update(arc_path, int_name, msbt.save())
+                                done += 1
+                            except Exception as e:
+                                errs.append(f"{rel_orig}: {e}")
+                            break
+        prog.close()
+        msg = f"Import terminé : {done} fichier(s) mis à jour."
+        if errs:
+            msg += f"\n\nErreurs :\n" + '\n'.join(errs[:15])
+        QMessageBox.information(self, "Import par lot", msg)
+
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    app.setStyle('Fusion')
+    win = MainWindow()
+    win.show()
     sys.exit(app.exec_())
